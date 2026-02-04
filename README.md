@@ -111,10 +111,43 @@ echo "test" | ./openllm-cli
 
 ### Default Models
 
-- **OpenRouter**: `openai/gpt-oss-20b:free`
-- **ChatGPT**: `gpt-3.5-turbo`
-- **Ollama**: `llama2`
-- **LM Studio**: `local-model`
+| Provider | `main.go` (built-in) | `env/` file |
+|----------|----------------------|-------------|
+| OpenRouter | `openai/gpt-oss-20b:free` | `openai/gpt-oss-20b:free` |
+| ChatGPT | `gpt-3.5-turbo` | `gpt-3.5-turbo` |
+| Ollama | `llama2` | `qwen3-vl:2b` |
+| LM Studio | `local-model` | `qwen/qwen3-coder-30b` |
+
+When `LLM_MODEL` is unset, the CLI uses the built-in `main.go` defaults. Sourcing an `env/` file overrides with that file's model.
+
+### Pre-configured Environment Files
+
+The `env/` folder contains ready-to-use environment files for each provider. Source one to quickly switch providers with sensible defaults (streaming enabled, 10-minute timeout):
+
+```bash
+# OpenRouter
+source env/environment_openrouter
+export OPENROUTER_API_KEY="your-key"
+
+# ChatGPT
+source env/environment_openai
+export OPENAI_API_KEY="your-key"
+
+# Ollama (local)
+source env/environment_ollama
+
+# LM Studio (local)
+source env/environment_lmstudio
+```
+
+| File | Provider | Model | Notes |
+|------|----------|-------|-------|
+| `environment_openrouter` | OpenRouter | `openai/gpt-oss-20b:free` | Set `OPENROUTER_API_KEY` |
+| `environment_openai` | ChatGPT | `gpt-3.5-turbo` | Set `OPENAI_API_KEY` |
+| `environment_ollama` | Ollama | `qwen3-vl:2b` | Uses default `OLLAMA_URL` |
+| `environment_lmstudio` | LM Studio | `qwen/qwen3-coder-30b` | Uses default `LM_STUDIO_URL` |
+
+All env files set: `LLM_STREAM=1`, `LLM_TIMEOUT=600`, `LLM_VERBOSE=false`. Edit the files to customize models or other settings.
 
 ### Setting Environment Variables
 

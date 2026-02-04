@@ -1,0 +1,7 @@
+export LLM_PROVIDER=openrouter
+export LLM_MODEL=openai/gpt-oss-20b:free
+export LLM_STREAM=1
+export LLM_TIMEOUT=600
+export LLM_VERBOSE=false
+export LLM_PRE_PROMPT=""
+export OPENROUTER_API_KEY=""

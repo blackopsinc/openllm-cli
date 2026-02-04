@@ -1,0 +1,7 @@
+export LLM_PROVIDER=lmstudio
+export LLM_MODEL=qwen/qwen3-coder-30b
+export LLM_STREAM=1
+export LLM_TIMEOUT=600
+export LLM_VERBOSE=false
+export LLM_PRE_PROMPT=""
+export LM_STUDIO_URL="http://localhost:1234/v1/chat/completions"

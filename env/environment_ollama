@@ -1,0 +1,7 @@
+export LLM_PROVIDER=ollama
+export LLM_MODEL=qwen3-vl:2b
+export LLM_STREAM=1
+export LLM_TIMEOUT=600
+export LLM_VERBOSE=false
+export LLM_PRE_PROMPT=""
+export OLLAMA_URL="http://localhost:11434/api/chat"
