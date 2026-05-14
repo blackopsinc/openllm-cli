@@ -1,684 +1,2080 @@
+// openllm-cli: an interactive LLM CLI with file I/O, shell execution, and auto mode.
+//
+// Usage:
+//   openllm-cli [flags]
+//   echo "prompt" | openllm-cli          (single-shot pipe mode)
+//
+// Flags:
+//   -i, --interactive   start interactive REPL (default when no stdin pipe)
+//   -a, --auto          auto mode: LLM can read/write files and run commands autonomously
+//   -s, --skills        enable skills mode: read SKILL.md/Skills.md and follow directions
+//   -h, --help          show help
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"strconv"
-	"strings"
-	"time"
+        "bufio"
+        "bytes"
+        "context"
+        "encoding/json"
+        "fmt"
+        "io"
+        "log"
+        "net/http"
+        "os"
+        "os/exec"
+        "path/filepath"
+        "regexp"
+        "runtime"
+        "strconv"
+        "strings"
+        "time"
+        "unicode"
 )
+
+// ============================================================
+// Constants
+// ============================================================
 
 const (
-	envAPIKey    = "OPENROUTER_API_KEY"
-	envOpenAIAPIKey = "OPENAI_API_KEY"
-	envProvider  = "LLM_PROVIDER"
-	envModel     = "LLM_MODEL"
-	envPrePrompt = "LLM_PRE_PROMPT"
-	envStream    = "LLM_STREAM"
-	envVerbose   = "LLM_VERBOSE"
-	envTimeout   = "LLM_TIMEOUT"
-	envOllamaURL = "OLLAMA_URL"
-	envLMStudioURL = "LM_STUDIO_URL"
+        // Environment variable names
+        envAPIKey       = "OPENROUTER_API_KEY"
+        envOpenAIKey    = "OPENAI_API_KEY"
+        envAnthropicKey = "ANTHROPIC_API_KEY"
+        envProvider     = "LLM_PROVIDER"
+        envModel        = "LLM_MODEL"
+        envSystemPrompt = "LLM_SYSTEM_PROMPT"
+        envStream       = "LLM_STREAM"
+        envVerbose      = "LLM_VERBOSE"
+        envTimeout      = "LLM_TIMEOUT"
+        envShellTimeout = "LLM_SHELL_TIMEOUT"
+        envMaxTokens    = "LLM_MAX_TOKENS"
+        envAutoApprove  = "LLM_AUTO_APPROVE" // skip confirmations in auto mode
+        envOllamaURL    = "OLLAMA_URL"
+        envLMStudioURL  = "LM_STUDIO_URL"
+        envSkillsMode   = "LLM_SKILLS_MODE"
+        envInteractive  = "LLM_INTERACTIVE"
 
-	defaultTimeout      = 60 * time.Second
-	defaultStreamTimeout = 300 * time.Second // 5 minutes for streaming
-	defaultModel        = "openai/gpt-oss-20b:free"
-	userAgent           = "OpenLLM-CLI/1.0"
+        // Defaults
+        defaultLLMTimeout    = 120 * time.Second
+        defaultStreamTimeout = 300 * time.Second
+        defaultShellTimeout  = 30 * time.Second
+        defaultMaxTokens     = 8096
+        maxFileReadSize      = 2 * 1024 * 1024 // 2 MB
 
-	// Provider URLs
-	openRouterURL  = "https://openrouter.ai/api/v1/chat/completions"
-	chatGPTURL     = "https://api.openai.com/v1/chat/completions"
-	defaultOllamaURL = "http://localhost:11434/api/chat"
-	defaultLMStudioURL = "http://localhost:1234/v1/chat/completions"
+        // Model defaults per provider
+        defaultOpenRouterModel = "openai/gpt-4o-mini"
+        defaultChatGPTModel    = "gpt-4o-mini"
+        defaultAnthropicModel  = "claude-sonnet-4-20250514"
+        defaultOllamaModel     = "llama3"
+        defaultLMStudioModel   = "local-model"
+
+        // API endpoints
+        openRouterURL      = "https://openrouter.ai/api/v1/chat/completions"
+        chatGPTURL         = "https://api.openai.com/v1/chat/completions"
+        anthropicURL       = "https://api.anthropic.com/v1/messages"
+        defaultOllamaURL   = "http://localhost:11434/api/chat"
+        defaultLMStudioURL = "http://localhost:1234/v1/chat/completions"
+        anthropicVersion   = "2023-06-01"
+        userAgent          = "openllm-cli/2.0"
+
+        // ANSI colors
+        colorReset   = "\033[0m"
+        colorBold    = "\033[1m"
+        colorDim     = "\033[2m"
+        colorCyan    = "\033[36m"
+        colorGreen   = "\033[32m"
+        colorYellow  = "\033[33m"
+        colorRed     = "\033[31m"
+        colorBlue    = "\033[34m"
+        colorMagenta = "\033[35m"
+
+        // Tool names
+        toolReadFile  = "read_file"
+        toolWriteFile = "write_file"
+        toolRunShell  = "run_shell"
+        toolDone      = "task_done"
 )
 
-// Provider represents the LLM provider type
+// autoSystemPrompt tells the model how to use tools.
+const autoSystemPrompt = `You are an AI assistant with access to the local filesystem and shell.
+When you need to take an action, emit exactly one XML tool call on its own line:
+
+  <read_file><path>./some/file.txt</path></read_file>
+  <write_file><path>./out.txt</path><content>text to write</content></write_file>
+  <run_shell><command>ls -la</command></run_shell>
+  <task_done><summary>Brief summary of what was accomplished.</summary></task_done>
+
+Rules:
+- Emit at most ONE tool call per response. Wait for the result before continuing.
+- After receiving a tool result, continue reasoning and emit the next tool call or answer.
+- When the task is fully complete, emit <task_done> with a summary.
+- Write concise explanations around tool calls so the user understands what you are doing.
+- Never fabricate tool results. Always wait for real output.`
+
+// skillsSystemPrompt is added when skills mode is enabled
+var skillsSystemPrompt = `
+
+SKILLS MODE ACTIVE: You have access to a skills configuration that defines allowed commands and file access patterns.
+When executing commands or reading files, they will be automatically validated against the skills configuration.
+You can use inline commands with backticks ` + "`command`" + ` and file references with @path/to/file in your responses.`
+
+// ============================================================
+// Provider
+// ============================================================
+
 type Provider string
 
 const (
-	ProviderOpenRouter Provider = "openrouter"
-	ProviderChatGPT    Provider = "chatgpt"
-	ProviderOllama     Provider = "ollama"
-	ProviderLMStudio   Provider = "lmstudio"
+        ProviderOpenRouter Provider = "openrouter"
+        ProviderChatGPT    Provider = "chatgpt"
+        ProviderAnthropic  Provider = "anthropic"
+        ProviderOllama     Provider = "ollama"
+        ProviderLMStudio   Provider = "lmstudio"
 )
 
-// OpenRouterRequest represents the request body for the OpenRouter API
-type OpenRouterRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
-	Stream   bool          `json:"stream,omitempty"`
+// ============================================================
+// Config
+// ============================================================
+
+type Config struct {
+        Provider     Provider
+        APIKey       string
+        Model        string
+        OllamaURL    string
+        LMStudioURL  string
+        SystemPrompt string
+        Stream       bool
+        Verbose      bool
+        LLMTimeout   time.Duration
+        ShellTimeout time.Duration
+        MaxTokens    int
+        AutoApprove  bool // skip y/N prompts for tool use
+        SkillsMode   bool // enable skills processing
 }
 
-// ChatMessage represents a message in a chat conversation
+func loadConfig() *Config {
+        providerStr := envOr(envProvider, string(ProviderOpenRouter))
+        provider := Provider(strings.ToLower(strings.TrimSpace(providerStr)))
+
+        validProviders := map[Provider]bool{
+                ProviderOpenRouter: true,
+                ProviderChatGPT:    true,
+                ProviderAnthropic:  true,
+                ProviderOllama:     true,
+                ProviderLMStudio:   true,
+        }
+        if !validProviders[provider] {
+                fatalf("Unknown provider %q. Choose from: openrouter, chatgpt, anthropic, ollama, lmstudio", provider)
+        }
+
+        apiKey := resolveAPIKey(provider)
+        model := resolveModel(provider)
+
+        maxTokens := defaultMaxTokens
+        if v, err := strconv.Atoi(os.Getenv(envMaxTokens)); err == nil && v > 0 {
+                maxTokens = v
+        }
+
+        stream := isTruthy(envStream)
+        llmTimeout := defaultLLMTimeout
+        if stream {
+                llmTimeout = defaultStreamTimeout
+        }
+        if v, err := strconv.Atoi(os.Getenv(envTimeout)); err == nil && v > 0 {
+                llmTimeout = time.Duration(v) * time.Second
+        }
+
+        shellTimeout := defaultShellTimeout
+        if v, err := strconv.Atoi(os.Getenv(envShellTimeout)); err == nil && v > 0 {
+                shellTimeout = time.Duration(v) * time.Second
+        }
+
+        return &Config{
+                Provider:     provider,
+                APIKey:       apiKey,
+                Model:        model,
+                OllamaURL:    envOr(envOllamaURL, defaultOllamaURL),
+                LMStudioURL:  envOr(envLMStudioURL, defaultLMStudioURL),
+                SystemPrompt: os.Getenv(envSystemPrompt),
+                Stream:       stream,
+                Verbose:      isTruthy(envVerbose),
+                LLMTimeout:   llmTimeout,
+                ShellTimeout: shellTimeout,
+                MaxTokens:    maxTokens,
+                AutoApprove:  isTruthy(envAutoApprove),
+                SkillsMode:   isTruthy(envSkillsMode),
+        }
+}
+
+func resolveAPIKey(p Provider) string {
+        switch p {
+        case ProviderChatGPT:
+                key := strings.TrimSpace(os.Getenv(envOpenAIKey))
+                if key == "" {
+                        fatalf("ChatGPT requires %s to be set", envOpenAIKey)
+                }
+                return key
+        case ProviderOpenRouter:
+                key := strings.TrimSpace(os.Getenv(envAPIKey))
+                if key == "" {
+                        fatalf("OpenRouter requires %s to be set", envAPIKey)
+                }
+                return key
+        case ProviderAnthropic:
+                key := strings.TrimSpace(os.Getenv(envAnthropicKey))
+                if key == "" {
+                        fatalf("Anthropic requires %s to be set", envAnthropicKey)
+                }
+                return key
+        }
+        return "" // Ollama, LM Studio don't need keys
+}
+
+func resolveModel(p Provider) string {
+        if m := strings.TrimSpace(os.Getenv(envModel)); m != "" {
+                return m
+        }
+        switch p {
+        case ProviderChatGPT:
+                return defaultChatGPTModel
+        case ProviderAnthropic:
+                return defaultAnthropicModel
+        case ProviderOllama:
+                return defaultOllamaModel
+        case ProviderLMStudio:
+                return defaultLMStudioModel
+        default:
+                return defaultOpenRouterModel
+        }
+}
+
+// ============================================================
+// Skills System
+// ============================================================
+
+// SkillsConfig holds parsed skills configuration
+type SkillsConfig struct {
+        Content          string
+        AllowedCommands  []string
+        AllowedPaths     []string
+        DisallowedPaths  []string
+        Instructions     string
+        AutoExecute      bool
+}
+
+// loadSkillsConfig reads and parses SKILL.md or Skills.md
+func loadSkillsConfig(workingDir string) (*SkillsConfig, error) {
+        // Try different possible filenames
+        filenames := []string{"SKILL.md", "Skills.md", "skills.md", "SKILLS.md"}
+
+        var skillsContent string
+        var foundFile string
+
+        for _, filename := range filenames {
+                path := filepath.Join(workingDir, filename)
+                if content, err := os.ReadFile(path); err == nil {
+                        skillsContent = string(content)
+                        foundFile = filename
+                        break
+                }
+        }
+
+        if skillsContent == "" {
+                return nil, fmt.Errorf("no skills file found (looked for: %s)", strings.Join(filenames, ", "))
+        }
+
+        infof("Loaded skills from %s", foundFile)
+
+        config := &SkillsConfig{
+                Content: skillsContent,
+        }
+
+        // Parse special directives from the skills file
+        config.parseDirectives(skillsContent)
+
+        return config, nil
+}
+
+// parseDirectives extracts configuration from skills markdown
+func (sc *SkillsConfig) parseDirectives(content string) {
+        lines := strings.Split(content, "\n")
+
+        var instructionsLines []string
+        inInstructions := false
+
+        for _, line := range lines {
+                line = strings.TrimSpace(line)
+
+                // Look for configuration blocks
+                if strings.HasPrefix(line, "## Instructions") || strings.HasPrefix(line, "# Instructions") {
+                        inInstructions = true
+                        continue
+                } else if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "# ") {
+                        inInstructions = false
+                }
+
+                if inInstructions && line != "" {
+                        instructionsLines = append(instructionsLines, line)
+                }
+
+                // Parse allowed commands
+                if strings.HasPrefix(line, "ALLOWED_COMMANDS:") {
+                        commands := strings.TrimPrefix(line, "ALLOWED_COMMANDS:")
+                        commands = strings.TrimSpace(commands)
+                        if commands != "" {
+                                sc.AllowedCommands = strings.Split(commands, ",")
+                                for i := range sc.AllowedCommands {
+                                        sc.AllowedCommands[i] = strings.TrimSpace(sc.AllowedCommands[i])
+                                }
+                        }
+                }
+
+                // Parse allowed paths
+                if strings.HasPrefix(line, "ALLOWED_PATHS:") {
+                        paths := strings.TrimPrefix(line, "ALLOWED_PATHS:")
+                        paths = strings.TrimSpace(paths)
+                        if paths != "" {
+                                sc.AllowedPaths = strings.Split(paths, ",")
+                                for i := range sc.AllowedPaths {
+                                        sc.AllowedPaths[i] = strings.TrimSpace(sc.AllowedPaths[i])
+                                }
+                        }
+                }
+
+                // Parse disallowed paths
+                if strings.HasPrefix(line, "DISALLOWED_PATHS:") {
+                        paths := strings.TrimPrefix(line, "DISALLOWED_PATHS:")
+                        paths = strings.TrimSpace(paths)
+                        if paths != "" {
+                                sc.DisallowedPaths = strings.Split(paths, ",")
+                                for i := range sc.DisallowedPaths {
+                                        sc.DisallowedPaths[i] = strings.TrimSpace(sc.DisallowedPaths[i])
+                                }
+                        }
+                }
+
+                // Parse auto-execute flag
+                if strings.Contains(line, "AUTO_EXECUTE:") && strings.Contains(line, "true") {
+                        sc.AutoExecute = true
+                }
+        }
+
+        if len(instructionsLines) > 0 {
+                sc.Instructions = strings.Join(instructionsLines, "\n")
+        }
+}
+
+// isCommandAllowed checks if a command is allowed based on skills configuration
+func (sc *SkillsConfig) isCommandAllowed(cmd string) bool {
+        if len(sc.AllowedCommands) == 0 {
+                // Default safe commands if none specified
+                defaultAllowed := []string{"curl", "id", "whoami", "date", "pwd", "ls", "cat", "head", "tail", "grep", "echo", "which", "uname"}
+                for _, allowed := range defaultAllowed {
+                        if strings.HasPrefix(cmd, allowed+" ") || cmd == allowed {
+                                return true
+                        }
+                }
+                return false
+        }
+
+        for _, allowed := range sc.AllowedCommands {
+                if strings.HasPrefix(cmd, allowed+" ") || cmd == allowed {
+                        return true
+                }
+        }
+        return false
+}
+
+// isPathAllowed checks if a path is allowed for reading
+func (sc *SkillsConfig) isPathAllowed(path string) bool {
+        absPath, err := filepath.Abs(path)
+        if err != nil {
+                return false
+        }
+
+        // Check disallowed paths first
+        for _, disallowed := range sc.DisallowedPaths {
+                if matched, _ := filepath.Match(disallowed, absPath); matched {
+                        return false
+                }
+                if strings.HasPrefix(absPath, disallowed) {
+                        return false
+                }
+        }
+
+        // If no allowed paths specified, allow current directory and subdirectories
+        if len(sc.AllowedPaths) == 0 {
+                cwd, _ := os.Getwd()
+                return strings.HasPrefix(absPath, cwd)
+        }
+
+        // Check allowed paths
+        for _, allowed := range sc.AllowedPaths {
+                allowedAbs, _ := filepath.Abs(allowed)
+                if strings.HasPrefix(absPath, allowedAbs) {
+                        return true
+                }
+        }
+
+        return false
+}
+
+// ============================================================
+// Wire types — shared between providers
+// ============================================================
+
+// ChatMessage is a single turn in a conversation.
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+        Role    string `json:"role"`
+        Content string `json:"content"`
 }
 
-// OpenRouterResponse represents the response from the OpenRouter API
-type OpenRouterResponse struct {
-	Choices []struct {
-		Delta struct {
-			Content string `json:"content"`
-		} `json:"delta"`
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-	} `json:"error,omitempty"`
+// LLMResponse is the parsed, provider-normalised reply from any backend.
+type LLMResponse struct {
+        Text       string
+        ToolCalls  []ToolCall // populated in auto mode
+        StopReason string
 }
 
-// OllamaResponse represents the response from Ollama's native API
-type OllamaResponse struct {
-	Message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	} `json:"message"`
-	Done   bool `json:"done"`
-	Error  string `json:"error,omitempty"`
+// ============================================================
+// Tool system (auto mode)
+// ============================================================
+
+// ToolCall is an action the LLM wants to take.
+type ToolCall struct {
+        Name  string
+        Input map[string]string
 }
+
+// parseToolCall scans the LLM's text for an XML tool call.
+// Returns nil if none found.
+func parseToolCall(text string) *ToolCall {
+        tools := []string{toolReadFile, toolWriteFile, toolRunShell, toolDone}
+        for _, name := range tools {
+                open := "<" + name + ">"
+                close := "</" + name + ">"
+                start := strings.Index(text, open)
+                end := strings.Index(text, close)
+                if start == -1 || end == -1 || end <= start {
+                        continue
+                }
+                inner := text[start+len(open) : end]
+                tc := &ToolCall{Name: name, Input: map[string]string{}}
+                // Extract child tags
+                for _, field := range []string{"path", "content", "command", "summary"} {
+                        if val := extractTag(inner, field); val != "" {
+                                tc.Input[field] = val
+                        }
+                }
+                return tc
+        }
+        return nil
+}
+
+func extractTag(s, tag string) string {
+        open := "<" + tag + ">"
+        close := "</" + tag + ">"
+        start := strings.Index(s, open)
+        end := strings.Index(s, close)
+        if start == -1 || end == -1 || end <= start {
+                return ""
+        }
+        return strings.TrimSpace(s[start+len(open) : end])
+}
+
+// ============================================================
+// Session — holds conversation state
+// ============================================================
+
+type Session struct {
+        cfg          *Config
+        history      []ChatMessage
+        cwd          string // tracked working directory
+        autoMode     bool
+        skillsMode   bool
+        skillsConfig *SkillsConfig
+}
+
+func newSession(cfg *Config, auto bool, skills bool) *Session {
+        cwd, _ := os.Getwd()
+        s := &Session{cfg: cfg, cwd: cwd, autoMode: auto, skillsMode: skills}
+
+        // Load skills configuration if skills mode is enabled
+        if skills {
+                if skillsConfig, err := loadSkillsConfig(cwd); err != nil {
+                        infof("Skills mode disabled: %v", err)
+                        s.skillsMode = false
+                } else {
+                        s.skillsConfig = skillsConfig
+                        infof("Skills mode enabled with %d allowed commands", len(skillsConfig.AllowedCommands))
+                }
+        }
+
+        return s
+}
+
+func (s *Session) addUser(content string)     { s.history = append(s.history, ChatMessage{"user", content}) }
+func (s *Session) addAssistant(content string) { s.history = append(s.history, ChatMessage{"assistant", content}) }
+func (s *Session) clearHistory()              { s.history = nil }
+
+// send calls the LLM with the current history and returns the response.
+func (s *Session) send() (*LLMResponse, error) {
+        return callLLM(s.cfg, s.history, s.autoMode, s.skillsMode, s.skillsConfig)
+}
+
+// ============================================================
+// Tool execution
+// ============================================================
+
+// executeTool runs a tool call and returns a result string to feed back to the LLM.
+func (s *Session) executeTool(tc *ToolCall) (string, error) {
+        switch tc.Name {
+
+        case toolReadFile:
+                path := tc.Input["path"]
+                if path == "" {
+                        return "", fmt.Errorf("read_file: missing <path>")
+                }
+
+                // Skills mode validation
+                if s.skillsMode && s.skillsConfig != nil {
+                        absPath := filepath.Join(s.cwd, path)
+                        if !s.skillsConfig.isPathAllowed(absPath) {
+                                return fmt.Sprintf("[read_file error: path %s not allowed by skills configuration]", path), nil
+                        }
+                }
+
+                content, err := readPath(filepath.Join(s.cwd, path))
+                if err != nil {
+                        return fmt.Sprintf("[read_file error: %v]", err), nil
+                }
+                return fmt.Sprintf("[read_file: %s]\n```\n%s\n```", path, content), nil
+
+        case toolWriteFile:
+                path := tc.Input["path"]
+                content := tc.Input["content"]
+                if path == "" {
+                        return "", fmt.Errorf("write_file: missing <path>")
+                }
+
+                // Skills mode validation
+                if s.skillsMode && s.skillsConfig != nil {
+                        absPath := filepath.Join(s.cwd, path)
+                        if !s.skillsConfig.isPathAllowed(absPath) {
+                                return fmt.Sprintf("[write_file error: path %s not allowed by skills configuration]", path), nil
+                        }
+                }
+
+                abs := filepath.Join(s.cwd, path)
+                if err := writeFileAtomic(abs, content); err != nil {
+                        return fmt.Sprintf("[write_file error: %v]", err), nil
+                }
+                return fmt.Sprintf("[write_file: wrote %d bytes to %s]", len(content), path), nil
+
+        case toolRunShell:
+                cmd := tc.Input["command"]
+                if cmd == "" {
+                        return "", fmt.Errorf("run_shell: missing <command>")
+                }
+
+                // Skills mode validation
+                if s.skillsMode && s.skillsConfig != nil {
+                        if !s.skillsConfig.isCommandAllowed(cmd) {
+                                return fmt.Sprintf("[run_shell error: command '%s' not allowed by skills configuration]", cmd), nil
+                        }
+                }
+
+                out, err := runShell(cmd, s.cwd, s.cfg.ShellTimeout)
+                result := out
+                if err != nil {
+                        result += "\n[exit error: " + err.Error() + "]"
+                }
+                if result == "" {
+                        result = "(no output)"
+                }
+                return fmt.Sprintf("[run_shell: `%s`]\n```\n%s\n```", cmd, result), nil
+
+        case toolDone:
+                summary := tc.Input["summary"]
+                return fmt.Sprintf("[task_done: %s]", summary), nil
+        }
+
+        return "", fmt.Errorf("unknown tool: %s", tc.Name)
+}
+
+// confirm asks the user to approve a tool call unless auto-approve is on.
+// Returns false if the user declines.
+func (s *Session) confirm(tc *ToolCall) bool {
+        if s.cfg.AutoApprove {
+                return true
+        }
+
+        // In skills mode with auto_execute, auto-approve safe commands
+        if s.skillsMode && s.skillsConfig != nil && s.skillsConfig.AutoExecute {
+                if tc.Name == toolRunShell {
+                        cmd := tc.Input["command"]
+                        if s.skillsConfig.isCommandAllowed(cmd) {
+                                return true
+                        }
+                }
+                if tc.Name == toolReadFile {
+                        path := tc.Input["path"]
+                        absPath := filepath.Join(s.cwd, path)
+                        if s.skillsConfig.isPathAllowed(absPath) {
+                                return true
+                        }
+                }
+        }
+
+        var desc string
+        switch tc.Name {
+        case toolReadFile:
+                desc = fmt.Sprintf("read %s", tc.Input["path"])
+        case toolWriteFile:
+                desc = fmt.Sprintf("write %s (%d bytes)", tc.Input["path"], len(tc.Input["content"]))
+        case toolRunShell:
+                desc = fmt.Sprintf("run: %s", tc.Input["command"])
+        case toolDone:
+                return true
+        default:
+                desc = tc.Name
+        }
+        fmt.Printf("\n%s%s  Allow: %s?%s  %s[y/N]%s ", colorBold, colorYellow, desc, colorReset, colorDim, colorReset)
+        var ans string
+        fmt.Scanln(&ans)
+        return strings.ToLower(strings.TrimSpace(ans)) == "y"
+}
+
+// ============================================================
+// Auto mode loop
+// ============================================================
+
+// runAutoTask runs a single task through the tool-use loop.
+// The user's message is already in s.history when this is called.
+func (s *Session) runAutoTask() error {
+        const maxRounds = 20
+
+        for round := 0; round < maxRounds; round++ {
+                resp, err := s.send()
+                if err != nil {
+                        return fmt.Errorf("LLM error: %w", err)
+                }
+
+                // Process skills inline commands and file references before printing
+                processedText := resp.Text
+                if s.skillsMode {
+                        processedText = s.processSkillsInline(resp.Text)
+                }
+
+                // Print the LLM's text response
+                printAssistant(s.cfg, processedText)
+                s.addAssistant(processedText)
+
+                // Look for a tool call in the original response (not processed)
+                tc := parseToolCall(resp.Text)
+                if tc == nil {
+                        // No tool call — conversation turn complete
+                        return nil
+                }
+
+                // task_done signals we're finished
+                if tc.Name == toolDone {
+                        fmt.Printf("\n%s✓ Done%s  %s\n\n", colorGreen+colorBold, colorReset, tc.Input["summary"])
+                        return nil
+                }
+
+                // Show the tool call to the user and confirm
+                printToolCall(tc)
+                if !s.confirm(tc) {
+                        s.addUser("[User declined this action. Stop and ask what to do instead.]")
+                        continue
+                }
+
+                // Execute and feed the result back
+                result, err := s.executeTool(tc)
+                if err != nil {
+                        result = fmt.Sprintf("[tool error: %v]", err)
+                }
+                printToolResult(result)
+                s.addUser(result)
+        }
+
+        return fmt.Errorf("reached maximum tool rounds (%d) without completing", maxRounds)
+}
+
+// processSkillsInline processes inline commands and file references in skills mode
+func (s *Session) processSkillsInline(text string) string {
+        if s.skillsConfig == nil {
+                return text
+        }
+
+        // Process backtick commands
+        text = s.processInlineCommands(text)
+
+        // Process @file references
+        text = s.processInlineFileRefs(text)
+
+        return text
+}
+
+// processInlineCommands executes commands in backticks if allowed
+func (s *Session) processInlineCommands(text string) string {
+        // Regex to find `command` patterns
+        re := regexp.MustCompile("`([^`]+)`")
+
+        return re.ReplaceAllStringFunc(text, func(match string) string {
+                cmd := match[1 : len(match)-1] // Remove backticks
+
+                if !s.skillsConfig.isCommandAllowed(cmd) {
+                        return fmt.Sprintf("[command '%s' not allowed]", cmd)
+                }
+
+                out, err := runShell(cmd, s.cwd, s.cfg.ShellTimeout)
+                if err != nil {
+                        out += " [error: " + err.Error() + "]"
+                }
+
+                fmt.Printf("%s[executed: `%s`]%s\n", colorDim, cmd, colorReset)
+
+                if out == "" {
+                        return "(no output)"
+                }
+                return out
+        })
+}
+
+// processInlineFileRefs reads files referenced with @path if allowed
+func (s *Session) processInlineFileRefs(text string) string {
+        // Regex to find @path patterns
+        re := regexp.MustCompile(`@([^\s]+)`)
+
+        return re.ReplaceAllStringFunc(text, func(match string) string {
+                path := match[1:] // Remove @
+                absPath := filepath.Join(s.cwd, path)
+
+                if !s.skillsConfig.isPathAllowed(absPath) {
+                        return fmt.Sprintf("[file '%s' not allowed]", path)
+                }
+
+                content, err := readPath(absPath)
+                if err != nil {
+                        return fmt.Sprintf("[file error: %v]", err)
+                }
+
+                fmt.Printf("%s[read: @%s]%s\n", colorDim, path, colorReset)
+
+                return fmt.Sprintf("[File: %s]\n```\n%s\n```", path, content)
+        })
+}
+
+// ============================================================
+// Interactive REPL
+// ============================================================
+
+func runInteractive(cfg *Config, autoMode, skillsMode bool) {
+        s := newSession(cfg, autoMode, skillsMode)
+        printBanner(cfg, autoMode, skillsMode)
+
+        scanner := bufio.NewScanner(os.Stdin)
+        scanner.Buffer(make([]byte, 1<<20), 1<<20)
+
+        for {
+                printPrompt(s)
+                if !scanner.Scan() {
+                        fmt.Printf("\n%sBye!%s\n", colorDim, colorReset)
+                        break
+                }
+
+                line := strings.TrimSpace(scanner.Text())
+                if line == "" {
+                        continue
+                }
+
+                // Slash commands
+                if strings.HasPrefix(line, "/") {
+                        if quit := s.handleSlashCommand(line, scanner); quit {
+                                break
+                        }
+                        continue
+                }
+
+                // Expand inline @file and `backtick` references
+                expanded, err := expandInline(line, cfg)
+                if err != nil {
+                        printError(err.Error())
+                        continue
+                }
+
+                s.addUser(expanded)
+
+                if autoMode {
+                        if err := s.runAutoTask(); err != nil {
+                                printError(err.Error())
+                        }
+                } else {
+                        resp, err := s.send()
+                        if err != nil {
+                                printError(err.Error())
+                                s.history = s.history[:len(s.history)-1] // roll back
+                                continue
+                        }
+
+                        // Process skills inline commands if skills mode is enabled
+                        responseText := resp.Text
+                        if skillsMode {
+                                responseText = s.processSkillsInline(resp.Text)
+                        }
+
+                        printAssistant(cfg, responseText)
+                        s.addAssistant(responseText)
+                }
+                fmt.Println()
+        }
+}
+
+// ============================================================
+// Slash commands
+// ============================================================
+
+func (s *Session) handleSlashCommand(line string, scanner *bufio.Scanner) (quit bool) {
+        parts := strings.SplitN(line, " ", 2)
+        cmd := strings.ToLower(parts[0])
+        arg := ""
+        if len(parts) > 1 {
+                arg = strings.TrimSpace(parts[1])
+        }
+
+        switch cmd {
+
+        // ---- session ----
+        case "/exit", "/quit", "/q":
+                fmt.Printf("%sBye!%s\n", colorDim, colorReset)
+                return true
+
+        case "/clear", "/reset":
+                s.clearHistory()
+                infof("Conversation cleared.")
+
+        case "/history":
+                s.printHistory()
+
+        // ---- config ----
+        case "/model":
+                if arg == "" {
+                        infof("Model: %s", s.cfg.Model)
+                } else {
+                        s.cfg.Model = arg
+                        infof("Model set to %s", s.cfg.Model)
+                }
+
+        case "/system":
+                if arg == "" {
+                        if s.cfg.SystemPrompt == "" {
+                                infof("No system prompt set.")
+                        } else {
+                                infof("System prompt: %s", s.cfg.SystemPrompt)
+                        }
+                } else {
+                        s.cfg.SystemPrompt = arg
+                        infof("System prompt updated.")
+                }
+
+        case "/stream":
+                s.cfg.Stream = !s.cfg.Stream
+                infof("Streaming: %v", s.cfg.Stream)
+
+        case "/auto":
+                s.autoMode = !s.autoMode
+                infof("Auto mode: %v", s.autoMode)
+
+        case "/skills":
+                s.skillsMode = !s.skillsMode
+                if s.skillsMode && s.skillsConfig == nil {
+                        // Try to load skills config
+                        if skillsConfig, err := loadSkillsConfig(s.cwd); err != nil {
+                                infof("Cannot enable skills mode: %v", err)
+                                s.skillsMode = false
+                        } else {
+                                s.skillsConfig = skillsConfig
+                                infof("Skills mode enabled")
+                        }
+                } else {
+                        infof("Skills mode: %v", s.skillsMode)
+                }
+
+        case "/approve":
+                s.cfg.AutoApprove = !s.cfg.AutoApprove
+                infof("Auto-approve: %v", s.cfg.AutoApprove)
+
+        case "/maxtokens":
+                if arg == "" {
+                        infof("max_tokens: %d", s.cfg.MaxTokens)
+                } else if v, err := strconv.Atoi(arg); err == nil && v > 0 {
+                        s.cfg.MaxTokens = v
+                        infof("max_tokens set to %d", v)
+                } else {
+                        printError("Invalid value: " + arg)
+                }
+
+        // ---- filesystem ----
+        case "/read":
+                if arg == "" {
+                        printError("Usage: /read <path>")
+                        break
+                }
+                s.cmdRead(arg, scanner)
+
+        case "/write":
+                if arg == "" {
+                        printError("Usage: /write <path>")
+                        break
+                }
+                s.cmdWrite(arg, scanner)
+
+        case "/ls":
+                dir := s.cwd
+                if arg != "" {
+                        dir = filepath.Join(s.cwd, arg)
+                }
+                listing, err := dirListing(dir)
+                if err != nil {
+                        printError(err.Error())
+                } else {
+                        fmt.Printf("%s%s%s\n", colorDim, listing, colorReset)
+                }
+
+        case "/pwd":
+                fmt.Printf("%s%s%s\n", colorCyan, s.cwd, colorReset)
+
+        case "/cd":
+                if arg == "" {
+                        printError("Usage: /cd <path>")
+                        break
+                }
+                target := filepath.Join(s.cwd, arg)
+                if info, err := os.Stat(target); err != nil || !info.IsDir() {
+                        printError(fmt.Sprintf("Not a directory: %s", target))
+                } else {
+                        s.cwd = filepath.Clean(target)
+                        infof("cwd: %s", s.cwd)
+                }
+
+        // ---- shell ----
+        case "/run", "/shell", "/exec":
+                if arg == "" {
+                        printError("Usage: /run <command>")
+                        break
+                }
+                s.cmdRun(arg, scanner)
+
+        case "/help":
+                printCommandHelp()
+
+        default:
+                printError(fmt.Sprintf("Unknown command: %s  (type /help)", cmd))
+        }
+
+        return false
+}
+
+// cmdRead reads a file/dir and optionally sends it to the LLM.
+func (s *Session) cmdRead(path string, scanner *bufio.Scanner) {
+        abs := filepath.Join(s.cwd, path)
+
+        // Skills mode validation
+        if s.skillsMode && s.skillsConfig != nil {
+                if !s.skillsConfig.isPathAllowed(abs) {
+                        printError(fmt.Sprintf("Path %s not allowed by skills configuration", path))
+                        return
+                }
+        }
+
+        content, err := readPath(abs)
+        if err != nil {
+                printError(err.Error())
+                return
+        }
+        fmt.Printf("%s── %s ──%s\n%s\n%s────%s\n", colorDim, path, colorReset, content, colorDim, colorReset)
+
+        if askYN(scanner, "Send to LLM?") {
+                prompt := askLine(scanner, "Add a message (or Enter to just send the file):")
+                msg := fmt.Sprintf("[File: %s]\n```\n%s\n```", path, content)
+                if prompt != "" {
+                        msg = prompt + "\n\n" + msg
+                }
+                s.addUser(msg)
+                s.dispatchLLM()
+        }
+}
+
+// cmdWrite writes content to a file. Uses last assistant reply if no content typed.
+func (s *Session) cmdWrite(path string, scanner *bufio.Scanner) {
+        abs := filepath.Join(s.cwd, path)
+
+        // Skills mode validation
+        if s.skillsMode && s.skillsConfig != nil {
+                if !s.skillsConfig.isPathAllowed(abs) {
+                        printError(fmt.Sprintf("Path %s not allowed by skills configuration", path))
+                        return
+                }
+        }
+
+        // Default to last assistant message
+        content := s.lastAssistantReply()
+        if content == "" {
+                fmt.Printf("%sEnter content (end with a single '.' on its own line):%s\n", colorDim, colorReset)
+                var lines []string
+                for scanner.Scan() {
+                        l := scanner.Text()
+                        if l == "." {
+                                break
+                        }
+                        lines = append(lines, l)
+                }
+                content = strings.Join(lines, "\n")
+        }
+
+        if !s.cfg.AutoApprove {
+                if !askYN(scanner, fmt.Sprintf("Write %d bytes to %s?", len(content), path)) {
+                        infof("Cancelled.")
+                        return
+                }
+        }
+        if err := writeFileAtomic(abs, content); err != nil {
+                printError(err.Error())
+        } else {
+                infof("Written: %s (%d bytes)", path, len(content))
+        }
+}
+
+// cmdRun executes a shell command and optionally sends output to the LLM.
+func (s *Session) cmdRun(cmd string, scanner *bufio.Scanner) {
+        // Skills mode validation
+        if s.skillsMode && s.skillsConfig != nil {
+                if !s.skillsConfig.isCommandAllowed(cmd) {
+                        printError(fmt.Sprintf("Command '%s' not allowed by skills configuration", cmd))
+                        return
+                }
+        }
+
+        if !s.cfg.AutoApprove {
+                fmt.Printf("%s%s⚠  Run: %s%s\n", colorBold, colorYellow, colorReset, cmd)
+                if !askYN(scanner, "Confirm?") {
+                        infof("Cancelled.")
+                        return
+                }
+        }
+        out, err := runShell(cmd, s.cwd, s.cfg.ShellTimeout)
+        if err != nil {
+                fmt.Printf("%s[exit error: %v]%s\n", colorRed, err, colorReset)
+        }
+        if out == "" {
+                out = "(no output)"
+        }
+        fmt.Printf("%s── output ──%s\n%s\n%s────%s\n", colorDim, colorReset, out, colorDim, colorReset)
+
+        if askYN(scanner, "Send output to LLM?") {
+                question := askLine(scanner, "What should I do with this? (or Enter to just send):")
+                msg := fmt.Sprintf("[Command: `%s`]\n```\n%s\n```", cmd, out)
+                if question != "" {
+                        msg = question + "\n\n" + msg
+                }
+                s.addUser(msg)
+                s.dispatchLLM()
+        }
+}
+
+// dispatchLLM sends the current history to the LLM (standard or auto mode) and handles the reply.
+func (s *Session) dispatchLLM() {
+        if s.autoMode {
+                if err := s.runAutoTask(); err != nil {
+                        printError(err.Error())
+                }
+        } else {
+                resp, err := s.send()
+                if err != nil {
+                        printError(err.Error())
+                        s.history = s.history[:len(s.history)-1]
+                        return
+                }
+
+                // Process skills inline commands if skills mode is enabled
+                responseText := resp.Text
+                if s.skillsMode {
+                        responseText = s.processSkillsInline(resp.Text)
+                }
+
+                printAssistant(s.cfg, responseText)
+                s.addAssistant(responseText)
+        }
+        fmt.Println()
+}
+
+func (s *Session) lastAssistantReply() string {
+        for i := len(s.history) - 1; i >= 0; i-- {
+                if s.history[i].Role == "assistant" {
+                        return s.history[i].Content
+                }
+        }
+        return ""
+}
+
+func (s *Session) printHistory() {
+        if len(s.history) == 0 {
+                infof("No history yet.")
+                return
+        }
+        fmt.Println()
+        for i, m := range s.history {
+                color := colorCyan
+                if m.Role == "assistant" {
+                        color = colorGreen
+                }
+                preview := m.Content
+                if len(preview) > 100 {
+                        preview = preview[:100] + "…"
+                }
+                fmt.Printf("  %s%d [%s]%s %s\n", color, i+1, m.Role, colorReset, preview)
+        }
+        fmt.Println()
+}
+
+// ============================================================
+// Inline expansion: @file and `backtick` in free-form messages
+// ============================================================
+
+// expandInline resolves @path and `cmd` tokens in a message before sending.
+// This lets the user write natural prompts like "review @main.go" or
+// "`ps aux` — what are all these processes?"
+func expandInline(input string, cfg *Config) (string, error) {
+        // Pass 1: backtick commands
+        var err error
+        input, err = expandBackticks(input, cfg.ShellTimeout)
+        if err != nil {
+                return "", err
+        }
+        // Pass 2: @file references
+        input, err = expandAtFiles(input)
+        return input, err
+}
+
+func expandBackticks(input string, timeout time.Duration) (string, error) {
+        var sb strings.Builder
+        i := 0
+        for i < len(input) {
+                if input[i] != '`' {
+                        sb.WriteByte(input[i])
+                        i++
+                        continue
+                }
+                j := i + 1
+                for j < len(input) && input[j] != '`' {
+                        j++
+                }
+                if j >= len(input) { // unmatched backtick — leave as-is
+                        sb.WriteByte('`')
+                        i++
+                        continue
+                }
+                cmd := input[i+1 : j]
+                out, _ := runShell(cmd, "", timeout)
+                fmt.Printf("%s[ran: `%s`]%s\n", colorDim, cmd, colorReset)
+                sb.WriteString(fmt.Sprintf("[Command: `%s`]\n```\n%s\n```", cmd, out))
+                i = j + 1
+        }
+        return sb.String(), nil
+}
+
+func expandAtFiles(input string) (string, error) {
+        var sb strings.Builder
+        i := 0
+        for i < len(input) {
+                if input[i] != '@' {
+                        sb.WriteByte(input[i])
+                        i++
+                        continue
+                }
+                j := i + 1
+                for j < len(input) && !unicode.IsSpace(rune(input[j])) {
+                        j++
+                }
+                token := input[i+1 : j]
+                if token == "" {
+                        sb.WriteByte('@')
+                        i++
+                        continue
+                }
+                content, err := readPath(token)
+                if err != nil {
+                        return "", fmt.Errorf("@%s: %w", token, err)
+                }
+                fmt.Printf("%s[injected: @%s]%s\n", colorDim, token, colorReset)
+                sb.WriteString(fmt.Sprintf("[File: %s]\n```\n%s\n```", token, content))
+                i = j
+        }
+        return sb.String(), nil
+}
+
+// ============================================================
+// Filesystem helpers
+// ============================================================
+
+func readPath(path string) (string, error) {
+        path = filepath.Clean(path)
+        info, err := os.Stat(path)
+        if err != nil {
+                return "", err
+        }
+        if info.IsDir() {
+                return dirListing(path)
+        }
+        if info.Size() > maxFileReadSize {
+                return "", fmt.Errorf("file too large (%d bytes; max %d)", info.Size(), maxFileReadSize)
+        }
+        data, err := os.ReadFile(path)
+        return string(data), err
+}
+
+func dirListing(dir string) (string, error) {
+        entries, err := os.ReadDir(dir)
+        if err != nil {
+                return "", err
+        }
+        var sb strings.Builder
+        sb.WriteString(dir + "/\n")
+        for _, e := range entries {
+                name := e.Name()
+                if e.IsDir() {
+                        sb.WriteString(fmt.Sprintf("  %-30s  <dir>\n", name+"/"))
+                        subs, _ := os.ReadDir(filepath.Join(dir, name))
+                        for _, se := range subs {
+                                sub := se.Name()
+                                if se.IsDir() {
+                                        sub += "/"
+                                }
+                                sb.WriteString(fmt.Sprintf("    %s\n", sub))
+                        }
+                } else {
+                        info, _ := e.Info()
+                        size := int64(0)
+                        if info != nil {
+                                size = info.Size()
+                        }
+                        sb.WriteString(fmt.Sprintf("  %-30s  %d bytes\n", name, size))
+                }
+        }
+        return sb.String(), nil
+}
+
+func writeFileAtomic(path, content string) error {
+        if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+                return err
+        }
+        return os.WriteFile(path, []byte(content), 0644)
+}
+
+// ============================================================
+// Shell execution
+// ============================================================
+
+func runShell(cmd, cwd string, timeout time.Duration) (string, error) {
+        ctx, cancel := context.WithTimeout(context.Background(), timeout)
+        defer cancel()
+
+        var c *exec.Cmd
+        if runtime.GOOS == "windows" {
+                c = exec.CommandContext(ctx, "cmd", "/C", cmd)
+        } else {
+                c = exec.CommandContext(ctx, "sh", "-c", cmd)
+        }
+        if cwd != "" {
+                c.Dir = cwd
+        }
+
+        var buf bytes.Buffer
+        c.Stdout = &buf
+        c.Stderr = &buf
+        err := c.Run()
+
+        if ctx.Err() == context.DeadlineExceeded {
+                return buf.String(), fmt.Errorf("timed out after %v", timeout)
+        }
+        // Non-zero exit is not a fatal error — return output + the error for context
+        return strings.TrimRight(buf.String(), "\n"), err
+}
+
+// ============================================================
+// LLM client — unified interface across all providers
+// ============================================================
+
+func callLLM(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+        switch cfg.Provider {
+        case ProviderAnthropic:
+                return callAnthropic(cfg, history, autoMode, skillsMode, skillsConfig)
+        default:
+                return callOpenAICompat(cfg, history, autoMode, skillsMode, skillsConfig)
+        }
+}
+
+// buildSystemPrompt returns the effective system prompt, merging auto-mode and skills instructions.
+func buildSystemPrompt(cfg *Config, autoMode, skillsMode bool, skillsConfig *SkillsConfig) string {
+        base := cfg.SystemPrompt
+
+        if autoMode {
+                if base != "" {
+                        base = base + "\n\n" + autoSystemPrompt
+                } else {
+                        base = autoSystemPrompt
+                }
+        }
+
+        if skillsMode && skillsConfig != nil {
+                base = base + skillsSystemPrompt
+                if skillsConfig.Instructions != "" {
+                        base = base + "\n\nSKILLS INSTRUCTIONS:\n" + skillsConfig.Instructions
+                }
+        }
+
+        return base
+}
+
+// buildOpenAIMessages converts history + system prompt into an OpenAI messages array.
+func buildOpenAIMessages(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) []ChatMessage {
+        sys := buildSystemPrompt(cfg, autoMode, skillsMode, skillsConfig)
+        if sys == "" {
+                return history
+        }
+        msgs := make([]ChatMessage, 0, len(history)+1)
+        msgs = append(msgs, ChatMessage{Role: "system", Content: sys})
+        msgs = append(msgs, history...)
+        return msgs
+}
+
+// ---- OpenAI-compatible (OpenRouter, ChatGPT, Ollama, LM Studio) ----
+
+type openAIRequest struct {
+        Model    string        `json:"model"`
+        Messages []ChatMessage `json:"messages"`
+        Stream   bool          `json:"stream,omitempty"`
+}
+
+type openAIResponse struct {
+        Choices []struct {
+                Delta   struct{ Content string `json:"content"` } `json:"delta"`
+                Message struct{ Content string `json:"content"` } `json:"message"`
+                FinishReason string `json:"finish_reason"`
+        } `json:"choices"`
+        Error *struct {
+                Message string `json:"message"`
+                Type    string `json:"type"`
+        } `json:"error,omitempty"`
+}
+
+type ollamaResponse struct {
+        Message struct {
+                Role    string `json:"role"`
+                Content string `json:"content"`
+        } `json:"message"`
+        Done  bool   `json:"done"`
+        Error string `json:"error,omitempty"`
+}
+
+func callOpenAICompat(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+        msgs := buildOpenAIMessages(cfg, history, autoMode, skillsMode, skillsConfig)
+
+        // If history already contains a system message (from auto mode), don't prepend again.
+        // Check if the first message is already "system" role.
+        if len(history) > 0 && history[0].Role == "system" {
+                msgs = history
+        }
+
+        apiURL := cfg.apiURL()
+        body := openAIRequest{Model: cfg.Model, Messages: msgs, Stream: cfg.Stream}
+
+        if cfg.Provider == ProviderOllama {
+                return callOllama(cfg, history, autoMode, skillsMode, skillsConfig)
+        }
+
+        return doOpenAIRequest(cfg, apiURL, body)
+}
+
+func doOpenAIRequest(cfg *Config, apiURL string, body openAIRequest) (*LLMResponse, error) {
+        data, err := json.Marshal(body)
+        if err != nil {
+                return nil, err
+        }
+
+        debugf(cfg, "POST %s  model=%s  messages=%d", apiURL, body.Model, len(body.Messages))
+
+        ctx, cancel := context.WithTimeout(context.Background(), cfg.LLMTimeout)
+        defer cancel()
+
+        req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(data))
+        if err != nil {
+                return nil, err
+        }
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("User-Agent", userAgent)
+        if cfg.APIKey != "" {
+                req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+        }
+        if cfg.Provider == ProviderOpenRouter {
+                req.Header.Set("X-Title", "openllm-cli")
+        }
+
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+                return nil, err
+        }
+        defer resp.Body.Close()
+
+        if !cfg.Stream {
+                return parseOpenAIResponse(resp)
+        }
+        return streamOpenAIResponse(cfg, resp)
+}
+
+func parseOpenAIResponse(resp *http.Response) (*LLMResponse, error) {
+        raw, err := io.ReadAll(resp.Body)
+        if err != nil {
+                return nil, err
+        }
+        if resp.StatusCode != http.StatusOK {
+                var e openAIResponse
+                if json.Unmarshal(raw, &e) == nil && e.Error != nil {
+                        return nil, fmt.Errorf("API error %d (%s): %s", resp.StatusCode, e.Error.Type, e.Error.Message)
+                }
+                return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, raw)
+        }
+        var r openAIResponse
+        if err := json.Unmarshal(raw, &r); err != nil {
+                return nil, err
+        }
+        if r.Error != nil {
+                return nil, fmt.Errorf("API error (%s): %s", r.Error.Type, r.Error.Message)
+        }
+        if len(r.Choices) == 0 {
+                return nil, fmt.Errorf("no choices in response")
+        }
+        return &LLMResponse{Text: r.Choices[0].Message.Content}, nil
+}
+
+func streamOpenAIResponse(cfg *Config, resp *http.Response) (*LLMResponse, error) {
+        if resp.StatusCode != http.StatusOK {
+                raw, _ := io.ReadAll(resp.Body)
+                return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, raw)
+        }
+
+        var full strings.Builder
+        scanner := bufio.NewScanner(resp.Body)
+        printStreamHeader(cfg)
+
+        for scanner.Scan() {
+                line := scanner.Text()
+                if !strings.HasPrefix(line, "data: ") {
+                        continue
+                }
+                data := line[6:]
+                if data == "[DONE]" {
+                        break
+                }
+                var chunk openAIResponse
+                if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+                        continue
+                }
+                if chunk.Error != nil {
+                        return nil, fmt.Errorf("stream error (%s): %s", chunk.Error.Type, chunk.Error.Message)
+                }
+                if len(chunk.Choices) > 0 {
+                        tok := chunk.Choices[0].Delta.Content
+                        if tok != "" {
+                                fmt.Print(tok)
+                                full.WriteString(tok)
+                        }
+                        if chunk.Choices[0].FinishReason != "" {
+                                break
+                        }
+                }
+        }
+        fmt.Println()
+        return &LLMResponse{Text: full.String()}, scanner.Err()
+}
+
+// ---- Ollama (uses same format but different streaming protocol) ----
+
+func callOllama(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+        msgs := buildOpenAIMessages(cfg, history, autoMode, skillsMode, skillsConfig)
+        if len(history) > 0 && history[0].Role == "system" {
+                msgs = history
+        }
+
+        body := map[string]interface{}{
+                "model":    cfg.Model,
+                "messages": msgs,
+                "stream":   cfg.Stream,
+        }
+        data, _ := json.Marshal(body)
+
+        debugf(cfg, "POST %s  model=%s", cfg.OllamaURL, cfg.Model)
+
+        ctx, cancel := context.WithTimeout(context.Background(), cfg.LLMTimeout)
+        defer cancel()
+
+        req, err := http.NewRequestWithContext(ctx, "POST", cfg.OllamaURL, bytes.NewReader(data))
+        if err != nil {
+                return nil, err
+        }
+        req.Header.Set("Content-Type", "application/json")
+
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+                return nil, err
+        }
+        defer resp.Body.Close()
+
+        if !cfg.Stream {
+                raw, _ := io.ReadAll(resp.Body)
+                var r ollamaResponse
+                if err := json.Unmarshal(raw, &r); err != nil {
+                        return nil, err
+                }
+                if r.Error != "" {
+                        return nil, fmt.Errorf("Ollama error: %s", r.Error)
+                }
+                return &LLMResponse{Text: r.Message.Content}, nil
+        }
+
+        // Streaming: newline-delimited JSON
+        var full strings.Builder
+        scanner := bufio.NewScanner(resp.Body)
+        printStreamHeader(cfg)
+        for scanner.Scan() {
+                var chunk ollamaResponse
+                if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+                        continue
+                }
+                if chunk.Error != "" {
+                        return nil, fmt.Errorf("Ollama stream error: %s", chunk.Error)
+                }
+                tok := chunk.Message.Content
+                if tok != "" {
+                        fmt.Print(tok)
+                        full.WriteString(tok)
+                }
+                if chunk.Done {
+                        break
+                }
+        }
+        fmt.Println()
+        return &LLMResponse{Text: full.String()}, scanner.Err()
+}
+
+// ---- Anthropic ----
+
+type anthropicRequest struct {
+        Model     string        `json:"model"`
+        MaxTokens int           `json:"max_tokens"`
+        System    string        `json:"system,omitempty"`
+        Messages  []ChatMessage `json:"messages"`
+        Stream    bool          `json:"stream,omitempty"`
+}
+
+type anthropicResponse struct {
+        Content []struct {
+                Type string `json:"type"`
+                Text string `json:"text"`
+        } `json:"content"`
+        StopReason string `json:"stop_reason"`
+        Error      *struct {
+                Type    string `json:"type"`
+                Message string `json:"message"`
+        } `json:"error,omitempty"`
+}
+
+type anthropicSSE struct {
+        Type  string `json:"type"`
+        Delta struct {
+                Type string `json:"type"`
+                Text string `json:"text"`
+        } `json:"delta"`
+        Error *struct {
+                Type    string `json:"type"`
+                Message string `json:"message"`
+        } `json:"error,omitempty"`
+}
+
+func callAnthropic(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+        // Anthropic puts system at the top level, not as a message
+        sys := buildSystemPrompt(cfg, autoMode, skillsMode, skillsConfig)
+        msgs := make([]ChatMessage, 0, len(history))
+        for _, m := range history {
+                if m.Role == "system" {
+                        // Carry system messages that were injected for auto mode into the top-level field
+                        if sys == "" {
+                                sys = m.Content
+                        } else {
+                                sys += "\n\n" + m.Content
+                        }
+                } else {
+                        msgs = append(msgs, m)
+                }
+        }
+
+        body := anthropicRequest{
+                Model:     cfg.Model,
+                MaxTokens: cfg.MaxTokens,
+                System:    sys,
+                Messages:  msgs,
+                Stream:    cfg.Stream,
+        }
+
+        data, _ := json.Marshal(body)
+        debugf(cfg, "POST %s  model=%s  max_tokens=%d", anthropicURL, cfg.Model, cfg.MaxTokens)
+
+        ctx, cancel := context.WithTimeout(context.Background(), cfg.LLMTimeout)
+        defer cancel()
+
+        req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewReader(data))
+        if err != nil {
+                return nil, err
+        }
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("User-Agent", userAgent)
+        req.Header.Set("x-api-key", cfg.APIKey)
+        req.Header.Set("anthropic-version", anthropicVersion)
+
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+                return nil, err
+        }
+        defer resp.Body.Close()
+
+        if !cfg.Stream {
+                raw, _ := io.ReadAll(resp.Body)
+                if resp.StatusCode != http.StatusOK {
+                        var e anthropicResponse
+                        if json.Unmarshal(raw, &e) == nil && e.Error != nil {
+                                return nil, fmt.Errorf("Anthropic error %d (%s): %s", resp.StatusCode, e.Error.Type, e.Error.Message)
+                        }
+                        return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, raw)
+                }
+                var r anthropicResponse
+                if err := json.Unmarshal(raw, &r); err != nil {
+                        return nil, err
+                }
+                if r.Error != nil {
+                        return nil, fmt.Errorf("Anthropic error (%s): %s", r.Error.Type, r.Error.Message)
+                }
+                var sb strings.Builder
+                for _, block := range r.Content {
+                        if block.Type == "text" {
+                                sb.WriteString(block.Text)
+                        }
+                }
+                return &LLMResponse{Text: sb.String(), StopReason: r.StopReason}, nil
+        }
+
+        // Streaming
+        if resp.StatusCode != http.StatusOK {
+                raw, _ := io.ReadAll(resp.Body)
+                return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, raw)
+        }
+        var full strings.Builder
+        scanner := bufio.NewScanner(resp.Body)
+        printStreamHeader(cfg)
+        for scanner.Scan() {
+                line := scanner.Text()
+                if !strings.HasPrefix(line, "data: ") {
+                        continue
+                }
+                var event anthropicSSE
+                if err := json.Unmarshal([]byte(line[6:]), &event); err != nil {
+                        continue
+                }
+                switch event.Type {
+                case "content_block_delta":
+                        if event.Delta.Text != "" {
+                                fmt.Print(event.Delta.Text)
+                                full.WriteString(event.Delta.Text)
+                        }
+                case "message_stop":
+                        goto done
+                case "error":
+                        if event.Error != nil {
+                                return nil, fmt.Errorf("Anthropic stream error (%s): %s", event.Error.Type, event.Error.Message)
+                        }
+                }
+        }
+done:
+        fmt.Println()
+        return &LLMResponse{Text: full.String()}, scanner.Err()
+}
+
+func (cfg *Config) apiURL() string {
+        switch cfg.Provider {
+        case ProviderChatGPT:
+                return chatGPTURL
+        case ProviderLMStudio:
+                return cfg.LMStudioURL
+        default: // OpenRouter
+                return openRouterURL
+        }
+}
+
+// ============================================================
+// Single-shot pipe mode
+// ============================================================
+
+func runPipe(cfg *Config) {
+        raw, err := io.ReadAll(os.Stdin)
+        if err != nil {
+                fatalf("reading stdin: %v", err)
+        }
+        input := strings.TrimSpace(string(raw))
+        if input == "" {
+                fatalf("stdin is empty")
+        }
+        // Expand inline references even in pipe mode
+        expanded, err := expandInline(input, cfg)
+        if err != nil {
+                fatalf("expand: %v", err)
+        }
+
+        s := newSession(cfg, false, cfg.SkillsMode)
+        s.addUser(expanded)
+
+        resp, err := s.send()
+        if err != nil {
+                fatalf("LLM: %v", err)
+        }
+
+        responseText := resp.Text
+        if cfg.SkillsMode {
+                responseText = s.processSkillsInline(resp.Text)
+        }
+
+        if !cfg.Stream {
+                fmt.Println(responseText)
+        }
+}
+
+// ============================================================
+// main
+// ============================================================
 
 func main() {
-	// Get provider from environment or default to openrouter
-	providerStr := strings.ToLower(strings.TrimSpace(os.Getenv(envProvider)))
-	if providerStr == "" {
-		providerStr = string(ProviderOpenRouter)
-	}
+        cfg := loadConfig()
 
-	provider := Provider(providerStr)
-	if provider != ProviderOpenRouter && provider != ProviderChatGPT && provider != ProviderOllama && provider != ProviderLMStudio {
-		log.Fatalf("Invalid provider: %s. Must be one of: openrouter, chatgpt, ollama, lmstudio", providerStr)
-	}
+        interactive := isTruthy(envInteractive) // can also be forced via env
+        autoMode := false
+        skillsMode := cfg.SkillsMode
 
-	// Get API key from environment (required for OpenRouter and ChatGPT, optional for others)
-	var apiKey string
-	if provider == ProviderChatGPT {
-		apiKey = strings.TrimSpace(os.Getenv(envOpenAIAPIKey))
-		if apiKey == "" {
-			log.Fatalf("API key is required for ChatGPT. Set %s environment variable", envOpenAIAPIKey)
-		}
-	} else if provider == ProviderOpenRouter {
-		apiKey = strings.TrimSpace(os.Getenv(envAPIKey))
-		if apiKey == "" {
-			log.Fatalf("API key is required for OpenRouter. Set %s environment variable", envAPIKey)
-		}
-	}
+        // Simple flag parsing — no external deps
+        args := os.Args[1:]
+        for _, arg := range args {
+                switch arg {
+                case "-i", "--interactive":
+                        interactive = true
+                case "-a", "--auto":
+                        interactive = true
+                        autoMode = true
+                case "-s", "--skills":
+                        interactive = true
+                        skillsMode = true
+                case "-h", "--help":
+                        printHelp()
+                        os.Exit(0)
+                }
+        }
 
-	// Get model from environment or use default
-	model := strings.TrimSpace(os.Getenv(envModel))
-	if model == "" {
-		if provider == ProviderOllama {
-			model = "llama2" // Default Ollama model
-		} else if provider == ProviderLMStudio {
-			model = "local-model" // Default LM Studio model
-		} else if provider == ProviderChatGPT {
-			model = "gpt-3.5-turbo" // Default ChatGPT model
-		} else {
-			model = defaultModel
-		}
-	}
+        // Auto-detect interactive when stdin is a terminal (not a pipe)
+        if !interactive && isTerminal() {
+                interactive = true
+        }
 
-	// Get provider-specific URLs
-	ollamaURL := strings.TrimSpace(os.Getenv(envOllamaURL))
-	if ollamaURL == "" {
-		ollamaURL = defaultOllamaURL
-	}
-
-	lmStudioURL := strings.TrimSpace(os.Getenv(envLMStudioURL))
-	if lmStudioURL == "" {
-		lmStudioURL = defaultLMStudioURL
-	}
-
-	// Check if streaming is enabled
-	stream := isEnvSet(envStream)
-
-	// Check if verbose mode is enabled
-	verbose := isEnvSet(envVerbose)
-
-	if verbose {
-		log.Printf("[DEBUG] Starting LLM CLI")
-		log.Printf("[DEBUG] Provider: %s", provider)
-		log.Printf("[DEBUG] Model: %s", model)
-		log.Printf("[DEBUG] Streaming: %v", stream)
-		if provider == ProviderOllama {
-			log.Printf("[DEBUG] Ollama URL: %s", ollamaURL)
-		}
-		if provider == ProviderLMStudio {
-			log.Printf("[DEBUG] LM Studio URL: %s", lmStudioURL)
-		}
-		if provider == ProviderChatGPT {
-			log.Printf("[DEBUG] ChatGPT URL: %s", chatGPTURL)
-		}
-	}
-
-	// Read and prepare input from stdin
-	input, err := prepareInput(verbose)
-	if err != nil {
-		log.Fatalf("Failed to prepare input: %v", err)
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Input length: %d characters", len(input))
-	}
-
-	// Get timeout based on whether streaming is enabled
-	timeout := getTimeout(stream)
-
-	if verbose {
-		log.Printf("[DEBUG] Timeout: %v", timeout)
-	}
-
-	// Send request based on provider
-	if stream {
-		err = sendStreamingRequest(provider, apiKey, input, model, ollamaURL, lmStudioURL, timeout, verbose)
-	} else {
-		response, err := sendRequest(provider, apiKey, input, model, ollamaURL, lmStudioURL, timeout, verbose)
-		if err != nil {
-			log.Fatalf("Request failed: %v", err)
-		}
-		fmt.Println(response)
-	}
-
-	if err != nil {
-		log.Fatalf("Request failed: %v", err)
-	}
+        if interactive {
+                runInteractive(cfg, autoMode, skillsMode)
+        } else {
+                runPipe(cfg)
+        }
 }
 
-// isEnvSet checks if an environment variable is set to a truthy value
-func isEnvSet(key string) bool {
-	val := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	return val == "1" || val == "true" || val == "yes" || val == "on"
+// isTerminal returns true when stdin is connected to a real terminal.
+func isTerminal() bool {
+        fi, err := os.Stdin.Stat()
+        if err != nil {
+                return false
+        }
+        return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// getTimeout parses the timeout from environment variable or returns default
-func getTimeout(streaming bool) time.Duration {
-	timeoutStr := strings.TrimSpace(os.Getenv(envTimeout))
-	if timeoutStr == "" {
-		if streaming {
-			return defaultStreamTimeout
-		}
-		return defaultTimeout
-	}
+// ============================================================
+// UI helpers
+// ============================================================
 
-	// Parse as seconds (integer)
-	seconds, err := strconv.Atoi(timeoutStr)
-	if err != nil {
-		log.Printf("Warning: Invalid timeout value '%s', using default", timeoutStr)
-		if streaming {
-			return defaultStreamTimeout
-		}
-		return defaultTimeout
-	}
+func printBanner(cfg *Config, autoMode, skillsMode bool) {
+        mode := "chat"
+        if autoMode {
+                mode = "auto"
+        }
+        if skillsMode {
+                if autoMode {
+                        mode = "auto+skills"
+                } else {
+                        mode = "skills"
+                }
+        }
+        wd, _ := os.Getwd()
+        fmt.Printf("\n%s%s openllm-cli%s  %s%s · %s · %s%s\n",
+                colorBold, colorCyan, colorReset,
+                colorDim, cfg.Provider, cfg.Model, mode, colorReset,
+        )
+        fmt.Printf("%scwd: %s%s\n", colorDim, wd, colorReset)
 
-	if seconds <= 0 {
-		log.Printf("Warning: Timeout must be positive, using default")
-		if streaming {
-			return defaultStreamTimeout
-		}
-		return defaultTimeout
-	}
+        helpText := "/help for commands · /auto to toggle auto mode"
+        if skillsMode {
+                helpText += " · /skills to toggle skills mode"
+        }
+        helpText += " · /exit to quit"
 
-	return time.Duration(seconds) * time.Second
+        fmt.Printf("%s%s%s\n\n", colorDim, helpText, colorReset)
 }
 
-// prepareInput reads from stdin and optionally prepends a pre-prompt
-func prepareInput(verbose bool) (string, error) {
-	if verbose {
-		log.Printf("[DEBUG] Reading input from stdin...")
-	}
-
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return "", fmt.Errorf("failed to read from stdin: %w", err)
-	}
-
-	input := strings.TrimSpace(string(data))
-	if input == "" {
-		return "", fmt.Errorf("input is empty")
-	}
-
-	// Prepend pre-prompt if set
-	if prePrompt := os.Getenv(envPrePrompt); prePrompt != "" {
-		if verbose {
-			log.Printf("[DEBUG] Prepending pre-prompt (length: %d)", len(prePrompt))
-		}
-		input = prePrompt + "\n\n" + input
-	}
-
-	return input, nil
+func printPrompt(s *Session) {
+        mode := ""
+        if s.autoMode && s.skillsMode {
+                mode = colorMagenta + " [auto+skills]" + colorReset
+        } else if s.autoMode {
+                mode = colorMagenta + " [auto]" + colorReset
+        } else if s.skillsMode {
+                mode = colorMagenta + " [skills]" + colorReset
+        }
+        fmt.Printf("%s%sopenllm-cli%s%s %s›%s ", colorBold, colorCyan, colorReset, mode, colorDim, colorReset)
 }
 
-// getAPIURL returns the appropriate API URL based on provider
-func getAPIURL(provider Provider, ollamaURL, lmStudioURL string) string {
-	switch provider {
-	case ProviderOllama:
-		return ollamaURL
-	case ProviderLMStudio:
-		return lmStudioURL
-	case ProviderChatGPT:
-		return chatGPTURL
-	default:
-		return openRouterURL
-	}
+func printAssistant(cfg *Config, text string) {
+        if cfg.Stream {
+                // Already printed token by token
+                return
+        }
+        fmt.Printf("\n%s%s%s\n%s", colorBold, colorGreen, cfg.Model, colorReset)
+        fmt.Println(text)
 }
 
-// sendRequest sends a request to the LLM API (non-streaming)
-func sendRequest(provider Provider, apiKey, input, modelName, ollamaURL, lmStudioURL string, timeout time.Duration, verbose bool) (string, error) {
-	apiURL := getAPIURL(provider, ollamaURL, lmStudioURL)
-
-	// Ollama uses a slightly different request format
-	var reqBody interface{}
-	if provider == ProviderOllama {
-		reqBody = map[string]interface{}{
-			"model": modelName,
-			"messages": []ChatMessage{
-				{
-					Role:    "user",
-					Content: input,
-				},
-			},
-			"stream": false,
-		}
-	} else {
-		reqBody = OpenRouterRequest{
-			Model: modelName,
-			Messages: []ChatMessage{
-				{
-					Role:    "user",
-					Content: input,
-				},
-			},
-			Stream: false,
-		}
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Request URL: %s", apiURL)
-		log.Printf("[DEBUG] Request body size: %d bytes", len(jsonData))
-		log.Printf("[DEBUG] Request model: %s", modelName)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-
-	// Set Authorization header for OpenRouter and ChatGPT
-	if provider == ProviderOpenRouter && apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Referer", "https://github.com/blackopsinc/openllm-cli")
-		req.Header.Set("X-Title", "OpenLLM CLI")
-	} else if provider == ProviderChatGPT && apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Sending HTTP POST request...")
-		if provider == ProviderOpenRouter || provider == ProviderChatGPT {
-			log.Printf("[DEBUG] API key present: %v (length: %d)", apiKey != "", len(apiKey))
-		}
-	}
-
-	client := &http.Client{Timeout: timeout}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("request timed out after %v", timeout)
-		}
-		return "", fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if verbose {
-		log.Printf("[DEBUG] Response status: %d %s", resp.StatusCode, resp.Status)
-		log.Printf("[DEBUG] Response headers: %v", resp.Header)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Response body size: %d bytes", len(body))
-	}
-
-	// Try to parse error response for non-200 status codes
-	if resp.StatusCode != http.StatusOK {
-		if provider == ProviderOllama {
-			var ollamaResp OllamaResponse
-			if err := json.Unmarshal(body, &ollamaResp); err == nil && ollamaResp.Error != "" {
-				return "", fmt.Errorf("HTTP %d - Ollama error: %s", resp.StatusCode, ollamaResp.Error)
-			}
-		} else {
-			var openRouterResp OpenRouterResponse
-			if err := json.Unmarshal(body, &openRouterResp); err == nil && openRouterResp.Error != nil {
-				return "", fmt.Errorf("HTTP %d - API error (%s): %s",
-					resp.StatusCode, openRouterResp.Error.Type, openRouterResp.Error.Message)
-			}
-		}
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Handle Ollama's native response format
-	if provider == ProviderOllama {
-		var ollamaResp OllamaResponse
-		if err := json.Unmarshal(body, &ollamaResp); err != nil {
-			if verbose {
-				log.Printf("[DEBUG] Failed to parse Ollama JSON response: %v", err)
-				log.Printf("[DEBUG] Response body (first 500 chars): %s", string(body[:min(500, len(body))]))
-			}
-			return "", fmt.Errorf("failed to parse Ollama response: %w", err)
-		}
-
-		if ollamaResp.Error != "" {
-			return "", fmt.Errorf("Ollama error: %s", ollamaResp.Error)
-		}
-
-		if verbose {
-			log.Printf("[DEBUG] Successfully received Ollama response")
-		}
-
-		return ollamaResp.Message.Content, nil
-	}
-
-	// Handle OpenAI-compatible response format (OpenRouter, ChatGPT, LM Studio)
-	var openRouterResp OpenRouterResponse
-	if err := json.Unmarshal(body, &openRouterResp); err != nil {
-		if verbose {
-			log.Printf("[DEBUG] Failed to parse JSON response: %v", err)
-			log.Printf("[DEBUG] Response body (first 500 chars): %s", string(body[:min(500, len(body))]))
-		}
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if openRouterResp.Error != nil {
-		return "", fmt.Errorf("API error (%s): %s",
-			openRouterResp.Error.Type, openRouterResp.Error.Message)
-	}
-
-	if len(openRouterResp.Choices) == 0 {
-		return "", fmt.Errorf("no response received from the API")
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Successfully received response with %d choice(s)", len(openRouterResp.Choices))
-	}
-
-	return openRouterResp.Choices[0].Message.Content, nil
+func printStreamHeader(cfg *Config) {
+        fmt.Printf("\n%s%s%s\n%s", colorBold, colorGreen, cfg.Model, colorReset)
 }
 
-// sendStreamingRequest sends a streaming request to the LLM API (SSE)
-func sendStreamingRequest(provider Provider, apiKey, input, modelName, ollamaURL, lmStudioURL string, timeout time.Duration, verbose bool) error {
-	apiURL := getAPIURL(provider, ollamaURL, lmStudioURL)
-
-	// Ollama uses a slightly different request format
-	var reqBody interface{}
-	if provider == ProviderOllama {
-		reqBody = map[string]interface{}{
-			"model": modelName,
-			"messages": []ChatMessage{
-				{
-					Role:    "user",
-					Content: input,
-				},
-			},
-			"stream": true,
-		}
-	} else {
-		reqBody = OpenRouterRequest{
-			Model: modelName,
-			Messages: []ChatMessage{
-				{
-					Role:    "user",
-					Content: input,
-				},
-			},
-			Stream: true,
-		}
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Streaming request URL: %s", apiURL)
-		log.Printf("[DEBUG] Request body size: %d bytes", len(jsonData))
-		log.Printf("[DEBUG] Request model: %s", modelName)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-
-	// Set Authorization header for OpenRouter and ChatGPT
-	if provider == ProviderOpenRouter && apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Referer", "https://github.com/blackopsinc/openllm-cli")
-		req.Header.Set("X-Title", "OpenLLM CLI")
-	} else if provider == ProviderChatGPT && apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Sending streaming HTTP POST request...")
-	}
-
-	// Use a longer timeout for the HTTP client to allow for slow streaming
-	// The context timeout will handle the overall request timeout
-	client := &http.Client{Timeout: timeout}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("request timed out after %v", timeout)
-		}
-		return fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if verbose {
-		log.Printf("[DEBUG] Response status: %d %s", resp.StatusCode, resp.Status)
-		log.Printf("[DEBUG] Content-Type: %s", resp.Header.Get("Content-Type"))
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		if provider == ProviderOllama {
-			var ollamaResp OllamaResponse
-			if err := json.Unmarshal(body, &ollamaResp); err == nil && ollamaResp.Error != "" {
-				return fmt.Errorf("HTTP %d - Ollama error: %s", resp.StatusCode, ollamaResp.Error)
-			}
-		} else {
-			var openRouterResp OpenRouterResponse
-			if err := json.Unmarshal(body, &openRouterResp); err == nil && openRouterResp.Error != nil {
-				return fmt.Errorf("HTTP %d - API error (%s): %s",
-					resp.StatusCode, openRouterResp.Error.Type, openRouterResp.Error.Message)
-			}
-		}
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Handle Ollama's native streaming format (newline-delimited JSON, not SSE)
-	if provider == ProviderOllama {
-		scanner := bufio.NewScanner(resp.Body)
-		var fullContent strings.Builder
-		chunkCount := 0
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				continue
-			}
-
-			if verbose {
-				log.Printf("[DEBUG] Ollama stream line: %s", line)
-			}
-
-			var chunk OllamaResponse
-			if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-				if verbose {
-					log.Printf("[DEBUG] Failed to parse Ollama chunk: %v", err)
-					log.Printf("[DEBUG] Chunk data: %s", line)
-				}
-				continue
-			}
-
-			if chunk.Error != "" {
-				return fmt.Errorf("Ollama error in stream: %s", chunk.Error)
-			}
-
-			if chunk.Message.Content != "" {
-				fmt.Print(chunk.Message.Content)
-				fullContent.WriteString(chunk.Message.Content)
-				chunkCount++
-			}
-
-			if chunk.Done {
-				if verbose {
-					log.Printf("[DEBUG] Ollama stream finished")
-				}
-				break
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			return fmt.Errorf("failed to read Ollama stream: %w", err)
-		}
-
-		if verbose {
-			log.Printf("[DEBUG] Ollama stream complete. Received %d chunks, total length: %d characters",
-				chunkCount, fullContent.Len())
-		}
-
-		fmt.Println()
-		return nil
-	}
-
-	// Parse SSE stream for OpenAI-compatible providers (OpenRouter, ChatGPT, LM Studio)
-	scanner := bufio.NewScanner(resp.Body)
-	var fullContent strings.Builder
-	chunkCount := 0
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if verbose {
-			log.Printf("[DEBUG] SSE line: %s", line)
-		}
-
-		// Skip empty lines and non-data lines
-		if line == "" || !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		// Extract JSON data
-		data := strings.TrimPrefix(line, "data: ")
-
-		// Check for [DONE] marker
-		if data == "[DONE]" {
-			if verbose {
-				log.Printf("[DEBUG] Received [DONE] marker, stream complete")
-			}
-			break
-		}
-
-		// Parse JSON chunk
-		var chunk OpenRouterResponse
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			if verbose {
-				log.Printf("[DEBUG] Failed to parse SSE chunk: %v", err)
-				log.Printf("[DEBUG] Chunk data: %s", data)
-			}
-			continue
-		}
-
-		// Check for errors in chunk
-		if chunk.Error != nil {
-			return fmt.Errorf("API error in stream (%s): %s",
-				chunk.Error.Type, chunk.Error.Message)
-		}
-
-		// Extract content from delta (streaming) or message (final)
-		if len(chunk.Choices) > 0 {
-			choice := chunk.Choices[0]
-			var content string
-
-			// Streaming responses use delta, final responses use message
-			if choice.Delta.Content != "" {
-				content = choice.Delta.Content
-			} else if choice.Message.Content != "" {
-				content = choice.Message.Content
-			}
-
-			if content != "" {
-				fmt.Print(content)
-				fullContent.WriteString(content)
-				chunkCount++
-			}
-
-			// Check for finish reason
-			if choice.FinishReason != "" {
-				if verbose {
-					log.Printf("[DEBUG] Stream finished with reason: %s", choice.FinishReason)
-				}
-				break
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("failed to read stream: %w", err)
-	}
-
-	if verbose {
-		log.Printf("[DEBUG] Stream complete. Received %d chunks, total length: %d characters",
-			chunkCount, fullContent.Len())
-	}
-
-	// Print newline after stream completes
-	fmt.Println()
-
-	return nil
+func printToolCall(tc *ToolCall) {
+        icon := map[string]string{
+                toolReadFile:  "📖",
+                toolWriteFile: "✏️ ",
+                toolRunShell:  "⚙️ ",
+                toolDone:      "✓ ",
+        }[tc.Name]
+        fmt.Printf("\n%s%s %s%s  ", colorBold, colorBlue, icon, colorReset)
+        switch tc.Name {
+        case toolReadFile:
+                fmt.Printf("read %s\n", tc.Input["path"])
+        case toolWriteFile:
+                fmt.Printf("write %s  (%d bytes)\n", tc.Input["path"], len(tc.Input["content"]))
+        case toolRunShell:
+                fmt.Printf("%s%s%s\n", colorYellow, tc.Input["command"], colorReset)
+        case toolDone:
+                fmt.Printf("task complete\n")
+        }
 }
 
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+func printToolResult(result string) {
+        lines := strings.Split(result, "\n")
+        preview := result
+        if len(lines) > 10 {
+                preview = strings.Join(lines[:10], "\n") + fmt.Sprintf("\n%s… (%d more lines)%s", colorDim, len(lines)-10, colorReset)
+        }
+        fmt.Printf("%s%s%s\n", colorDim, preview, colorReset)
 }
 
+func printError(msg string) {
+        fmt.Fprintf(os.Stderr, "%s%s error:%s %s\n", colorBold, colorRed, colorReset, msg)
+}
+
+func infof(format string, args ...interface{}) {
+        fmt.Printf("%s"+format+"%s\n", append([]interface{}{colorDim}, append(args, colorReset)...)...)
+}
+
+func debugf(cfg *Config, format string, args ...interface{}) {
+        if cfg.Verbose {
+                log.Printf("[DEBUG] "+format, args...)
+        }
+}
+
+func printCommandHelp() {
+        type row struct{ cmd, desc string }
+        sections := []struct {
+                name string
+                rows []row
+        }{
+                {"Session", []row{
+                        {"/help", "show this help"},
+                        {"/exit  /quit  /q", "quit"},
+                        {"/clear  /reset", "clear conversation history"},
+                        {"/history", "show message history"},
+                }},
+                {"Config", []row{
+                        {"/model [name]", "get/set model"},
+                        {"/system [text]", "get/set system prompt"},
+                        {"/stream", "toggle streaming"},
+                        {"/auto", "toggle auto mode (tool use)"},
+                        {"/skills", "toggle skills mode (SKILL.md integration)"},
+                        {"/approve", "toggle auto-approve for tool actions"},
+                        {"/maxtokens [n]", "get/set max_tokens (Anthropic)"},
+                }},
+                {"Filesystem", []row{
+                        {"/read <path>", "read file or directory; optionally send to LLM"},
+                        {"/write <path>", "write last LLM reply (or typed text) to a file"},
+                        {"/ls [path]", "list directory"},
+                        {"/pwd", "working directory"},
+                        {"/cd <path>", "change directory"},
+                }},
+                {"Shell", []row{
+                        {"/run <cmd>", "run shell command; optionally send output to LLM"},
+                        {"/shell  /exec", "aliases for /run"},
+                }},
+        }
+
+        fmt.Println()
+        for _, sec := range sections {
+                fmt.Printf("%s%s%s\n", colorBold, sec.name, colorReset)
+                for _, r := range sec.rows {
+                        fmt.Printf("  %s%-22s%s  %s%s%s\n", colorYellow, r.cmd, colorReset, colorDim, r.desc, colorReset)
+                }
+                fmt.Println()
+        }
+
+        fmt.Printf("%sInline syntax (in any message)%s\n", colorBold, colorReset)
+        fmt.Printf("  %s@path/to/file%s   inject file or directory into prompt\n", colorMagenta, colorReset)
+        fmt.Printf("  %s`cmd`%s           run command and inject output into prompt\n", colorMagenta, colorReset)
+        fmt.Println()
+
+        fmt.Printf("%sSkills mode%s — controlled command execution and file access:\n", colorBold, colorReset)
+        fmt.Printf("  Start with %s-s%s / %s--skills%s, or type %s/skills%s to toggle.\n", colorYellow, colorReset, colorYellow, colorReset, colorYellow, colorReset)
+        fmt.Printf("  Reads SKILL.md/Skills.md for allowed commands and paths.\n")
+        fmt.Printf("  AI can use inline `commands` and @file references safely.\n\n")
+
+        fmt.Printf("%sAuto mode%s — the LLM can use tools autonomously:\n", colorBold, colorReset)
+        fmt.Printf("  Start with %s-a%s / %s--auto%s, or type %s/auto%s to toggle.\n", colorYellow, colorReset, colorYellow, colorReset, colorYellow, colorReset)
+        fmt.Printf("  Tools: read_file · write_file · run_shell\n")
+        fmt.Printf("  Each tool action requires confirmation unless %sLLM_AUTO_APPROVE=1%s.\n\n", colorYellow, colorReset)
+
+        fmt.Printf("%sExamples%s\n", colorBold, colorReset)
+        fmt.Printf("  openllm-cli > review @./main.go and list any bugs\n")
+        fmt.Printf("  openllm-cli > `ps aux` what are all these processes?\n")
+        fmt.Printf("  openllm-cli -a > read package.json and update the version to 2.0.0\n")
+        fmt.Printf("  openllm-cli -s > what system info can you gather?\n\n")
+}
+
+func printHelp() {
+        fmt.Printf(`%s%sopenllm-cli%s
+
+Interactive LLM CLI with filesystem access, auto mode, and skills integration.
+
+%sUsage:%s
+  openllm-cli                  interactive REPL (auto-detected)
+  openllm-cli -i               force interactive mode
+  openllm-cli -a               interactive mode with auto tool use
+  openllm-cli -s               interactive mode with skills integration
+  echo "prompt" | openllm-cli  single-shot pipe mode
+
+%sFlags:%s
+  -i, --interactive   interactive REPL
+  -a, --auto          auto mode (LLM can read/write files and run commands)
+  -s, --skills        skills mode (read SKILL.md and allow inline commands/files)
+  -h, --help          show this help
+
+%sEnvironment:%s
+  LLM_PROVIDER         openrouter* | chatgpt | anthropic | ollama | lmstudio
+  LLM_MODEL            model name (provider default used if unset)
+  LLM_STREAM           1/true to enable streaming tokens
+  LLM_SYSTEM_PROMPT    system prompt
+  LLM_MAX_TOKENS       max tokens to generate (default %d)
+  LLM_TIMEOUT          LLM request timeout seconds (default 120 / 300 streaming)
+  LLM_SHELL_TIMEOUT    shell command timeout seconds (default 30)
+  LLM_AUTO_APPROVE     1/true to skip tool-use confirmations
+  LLM_SKILLS_MODE      1/true to enable skills mode by default
+  LLM_VERBOSE          1/true for debug logging
+
+  OPENROUTER_API_KEY   required for openrouter
+  OPENAI_API_KEY       required for chatgpt
+  ANTHROPIC_API_KEY    required for anthropic
+  OLLAMA_URL           ollama endpoint (default %s)
+  LM_STUDIO_URL        lm studio endpoint (default %s)
+
+%sModel defaults:%s
+  openrouter   %s
+  chatgpt      %s
+  anthropic    %s
+  ollama       %s
+  lmstudio     %s
+
+%sSkills configuration (SKILL.md/Skills.md):%s
+  ALLOWED_COMMANDS: curl,id,whoami,date
+  ALLOWED_PATHS: .,./config,/tmp
+  DISALLOWED_PATHS: ~/.ssh,/etc
+  AUTO_EXECUTE: true
+
+  ## Instructions
+  You are a system assistant that can gather information safely.
+`,
+                colorBold, colorCyan, colorReset,
+                colorBold, colorReset,
+                colorBold, colorReset,
+                colorBold, colorReset,
+                defaultMaxTokens,
+                defaultOllamaURL,
+                defaultLMStudioURL,
+                colorBold, colorReset,
+                defaultOpenRouterModel,
+                defaultChatGPTModel,
+                defaultAnthropicModel,
+                defaultOllamaModel,
+                defaultLMStudioModel,
+                colorBold, colorReset,
+        )
+}
+
+// ============================================================
+// Small utilities
+// ============================================================
+
+func isTruthy(key string) bool {
+        v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+        return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func envOr(key, fallback string) string {
+        if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+                return v
+        }
+        return fallback
+}
+
+func fatalf(format string, args ...interface{}) {
+        fmt.Fprintf(os.Stderr, colorRed+"error: "+colorReset+format+"\n", args...)
+        os.Exit(1)
+}
+
+func askYN(scanner *bufio.Scanner, prompt string) bool {
+        fmt.Printf("%s%s [y/N]%s ", colorDim, prompt, colorReset)
+        if !scanner.Scan() {
+                return false
+        }
+        return strings.ToLower(strings.TrimSpace(scanner.Text())) == "y"
+}
+
+func askLine(scanner *bufio.Scanner, prompt string) string {
+        fmt.Printf("%s%s%s ", colorDim, prompt, colorReset)
+        if !scanner.Scan() {
+                return ""
+        }
+        return strings.TrimSpace(scanner.Text())
+}
