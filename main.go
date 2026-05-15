@@ -68,6 +68,7 @@ const (
         defaultShellTimeout  = 60 * time.Second
         defaultMaxTokens     = 8096
         maxFileReadSize      = 2 * 1024 * 1024 // 2 MB
+        maxShellOutputChars  = 12 * 1024        // 12 KB — prevents HTML blobs from overflowing context
 
         // Model defaults per provider
         defaultOpenRouterModel = "openai/gpt-4o-mini"
@@ -133,6 +134,7 @@ Rule 2: WAIT for the tool result before writing your next response. Never invent
 Rule 3: Do NOT wrap tool calls in code fences or markdown blocks.
 Rule 4: After every result, reason briefly then emit the next tool call or task_done.
 Rule 5: Every task ends with task_done.
+Rule 6: Shell output is capped at ~12 KB. For web pages or large files, pipe through grep/head/sed to extract only what you need. Example: curl -s URL | grep -i "headline\|title" | head -40
 
 ONE CALL. WAIT. ONE CALL. WAIT. Repeat until done.
 
@@ -709,6 +711,9 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
                 if result == "" {
                         result = "(no output)"
                 }
+                if len(result) > maxShellOutputChars {
+                        result = result[:maxShellOutputChars] + fmt.Sprintf("\n[...output truncated: %d chars total. Use grep/head/tail/jq to filter first.]", len(result))
+                }
                 return fmt.Sprintf("[run_shell: `%s`]\n```\n%s\n```", cmd, result), nil
 
         case toolDone:
@@ -790,6 +795,7 @@ func (s *Session) runAutoTask() error {
                 // Look for a tool call in the original response (not processed)
                 tc := parseToolCall(resp.Text)
                 if tc == nil {
+                        debugf(s.cfg, "no tool call detected in response (round %d)", round+1)
                         // No tool call — conversation turn complete
                         return nil
                 }
@@ -1220,7 +1226,7 @@ func runInteractive(cfg *Config, autoMode, skillsMode bool) {
 
                 s.addUser(expanded)
 
-                if autoMode {
+                if s.autoMode {
                         if err := s.runAutoTask(); err != nil {
                                 if errors.Is(err, context.Canceled) {
                                         fmt.Printf("\n%s[interrupted]%s\n", colorYellow, colorReset)
@@ -1242,7 +1248,7 @@ func runInteractive(cfg *Config, autoMode, skillsMode bool) {
                         }
 
                         responseText := resp.Text
-                        if skillsMode {
+                        if s.skillsMode {
                                 responseText = s.processSkillsInline(resp.Text)
                         }
                         printAssistant(cfg, responseText)
