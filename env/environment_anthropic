@@ -1,24 +1,19 @@
-# Ollama provider configuration (local, no API key required)
-# Usage: source env/environment_ollama
-# Requires: ollama serve && ollama pull <model>
+# Anthropic provider configuration
+# Usage: source env/environment_anthropic
 
 # ── Provider ────────────────────────────────────────────────
-export LLM_PROVIDER=ollama
-export LLM_MODEL=gemma3:4b
-# Other Ollama models:
-#   gemma3:12b             (larger Gemma 3 variant)
-#   llama3:8b              (Meta Llama 3, good all-rounder)
-#   qwen2.5-coder:7b       (strong at code tasks)
-#   deepseek-coder:6.7b    (code focused)
-#   phi3:mini              (small, fast)
-#   mistral:7b             (Mistral AI)
+export LLM_PROVIDER=anthropic
+export LLM_MODEL=claude-opus-4-7
+# Other Anthropic models:
+#   claude-sonnet-4-20250514   (faster, cheaper)
+#   claude-haiku-4-5-20251001  (fastest)
 
-# ── Endpoint ────────────────────────────────────────────────
-export OLLAMA_URL="http://localhost:11434/api/chat"
+# ── API key ─────────────────────────────────────────────────
+export ANTHROPIC_API_KEY=""
 
 # ── Request settings ────────────────────────────────────────
 export LLM_MAX_TOKENS=8096       # max tokens to generate
-export LLM_TIMEOUT=600           # LLM request timeout in seconds (local models can be slow)
+export LLM_TIMEOUT=600           # LLM request timeout in seconds
 export LLM_SHELL_TIMEOUT=60      # shell command timeout in seconds (auto mode)
 export LLM_STREAM=1              # 1=streaming tokens, 0=wait for full response
 

@@ -1,7 +1,28 @@
-export LLM_PROVIDER=chatgpt
-export LLM_MODEL=gpt-3.5-turbo
-export LLM_STREAM=1
-export LLM_TIMEOUT=600
-export LLM_VERBOSE=false
-export LLM_PRE_PROMPT=""
-export OPENAI_API_KEY=""
+# OpenAI provider configuration
+# Usage: source env/environment_openai
+
+# ── Provider ────────────────────────────────────────────────
+export LLM_PROVIDER=openai
+export LLM_MODEL=gpt-4o-mini
+# Other OpenAI models:
+#   gpt-4o          (most capable)
+#   gpt-4-turbo     (cost/performance balance)
+#   gpt-3.5-turbo   (fastest, cheapest)
+
+# ── API key ─────────────────────────────────────────────────
+export OPENAI_API_KEY=""     # set your key here or export before sourcing
+
+# ── Request settings ────────────────────────────────────────
+export LLM_MAX_TOKENS=8096       # max tokens to generate
+export LLM_TIMEOUT=600           # LLM request timeout in seconds
+export LLM_SHELL_TIMEOUT=60      # shell command timeout in seconds (auto mode)
+export LLM_STREAM=1              # 1=streaming tokens, 0=wait for full response
+
+# ── Behaviour ───────────────────────────────────────────────
+export LLM_SYSTEM_PROMPT=""      # custom system prompt (optional)
+export LLM_AUTO_APPROVE=0        # 1=skip tool-use confirmations (non-auto mode)
+export LLM_SKILLS_MODE=0         # 1=enable skills mode (reads SKILL.md)
+export LLM_INTERACTIVE=0         # 1=force interactive REPL even when piped
+
+# ── Debug ───────────────────────────────────────────────────
+export LLM_VERBOSE=false         # true=debug logging

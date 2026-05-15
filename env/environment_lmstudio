@@ -1,7 +1,27 @@
+# LM Studio provider configuration (local, no API key required)
+# Usage: source env/environment_lmstudio
+# Requires: LM Studio running with a model loaded and local server enabled (Developer tab)
+
+# ── Provider ────────────────────────────────────────────────
 export LLM_PROVIDER=lmstudio
 export LLM_MODEL=qwen/qwen3-coder-30b
-export LLM_STREAM=1
-export LLM_TIMEOUT=600
-export LLM_VERBOSE=false
-export LLM_PRE_PROMPT=""
+# LM Studio uses whatever model is loaded in the app.
+# The model name here must match the identifier shown in LM Studio.
+
+# ── Endpoint ────────────────────────────────────────────────
 export LM_STUDIO_URL="http://localhost:1234/v1/chat/completions"
+
+# ── Request settings ────────────────────────────────────────
+export LLM_MAX_TOKENS=8096       # max tokens to generate
+export LLM_TIMEOUT=600           # LLM request timeout in seconds (large local models can be slow)
+export LLM_SHELL_TIMEOUT=60      # shell command timeout in seconds (auto mode)
+export LLM_STREAM=1              # 1=streaming tokens, 0=wait for full response
+
+# ── Behaviour ───────────────────────────────────────────────
+export LLM_SYSTEM_PROMPT=""      # custom system prompt (optional)
+export LLM_AUTO_APPROVE=0        # 1=skip tool-use confirmations (non-auto mode)
+export LLM_SKILLS_MODE=0         # 1=enable skills mode (reads SKILL.md)
+export LLM_INTERACTIVE=0         # 1=force interactive REPL even when piped
+
+# ── Debug ───────────────────────────────────────────────────
+export LLM_VERBOSE=false         # true=debug logging
