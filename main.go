@@ -16,20 +16,28 @@ import (
         "bytes"
         "context"
         "encoding/json"
+        "errors"
         "fmt"
         "io"
         "log"
         "net/http"
         "os"
         "os/exec"
+        "os/signal"
         "path/filepath"
         "regexp"
         "runtime"
         "strconv"
         "strings"
+        "sync"
         "time"
         "unicode"
+
+        "golang.org/x/term"
 )
+
+// version is set at build time via -ldflags "-X main.version=..."
+var version = "dev"
 
 // ============================================================
 // Constants
@@ -57,20 +65,20 @@ const (
         // Defaults
         defaultLLMTimeout    = 120 * time.Second
         defaultStreamTimeout = 300 * time.Second
-        defaultShellTimeout  = 30 * time.Second
+        defaultShellTimeout  = 60 * time.Second
         defaultMaxTokens     = 8096
         maxFileReadSize      = 2 * 1024 * 1024 // 2 MB
 
         // Model defaults per provider
         defaultOpenRouterModel = "openai/gpt-4o-mini"
-        defaultChatGPTModel    = "gpt-4o-mini"
+        defaultOpenAIModel     = "gpt-4o-mini"
         defaultAnthropicModel  = "claude-sonnet-4-20250514"
-        defaultOllamaModel     = "llama3"
+        defaultOllamaModel     = "gemma3:4b"
         defaultLMStudioModel   = "local-model"
 
         // API endpoints
         openRouterURL      = "https://openrouter.ai/api/v1/chat/completions"
-        chatGPTURL         = "https://api.openai.com/v1/chat/completions"
+        openAIURL          = "https://api.openai.com/v1/chat/completions"
         anthropicURL       = "https://api.anthropic.com/v1/messages"
         defaultOllamaURL   = "http://localhost:11434/api/chat"
         defaultLMStudioURL = "http://localhost:1234/v1/chat/completions"
@@ -95,21 +103,68 @@ const (
         toolDone      = "task_done"
 )
 
-// autoSystemPrompt tells the model how to use tools.
-const autoSystemPrompt = `You are an AI assistant with access to the local filesystem and shell.
-When you need to take an action, emit exactly one XML tool call on its own line:
+// autoSystemPrompt is designed to work across all model families and sizes —
+// from mistral:7b and phi3:mini up to GPT-4o and Claude Opus.
+const autoSystemPrompt = `You are an autonomous AI agent. You have access to the local filesystem and shell.
+Files are created in the current working directory.
 
-  <read_file><path>./some/file.txt</path></read_file>
-  <write_file><path>./out.txt</path><content>text to write</content></write_file>
-  <run_shell><command>ls -la</command></run_shell>
-  <task_done><summary>Brief summary of what was accomplished.</summary></task_done>
+## TOOL FORMAT
 
-Rules:
-- Emit at most ONE tool call per response. Wait for the result before continuing.
-- After receiving a tool result, continue reasoning and emit the next tool call or answer.
-- When the task is fully complete, emit <task_done> with a summary.
-- Write concise explanations around tool calls so the user understands what you are doing.
-- Never fabricate tool results. Always wait for real output.`
+To take an action, output one of these XML blocks — raw, never inside code fences:
+
+READ A FILE
+<read_file><path>./path/to/file</path></read_file>
+
+WRITE A FILE
+<write_file><path>./path/to/file</path><content>
+full file contents go here
+</content></write_file>
+
+RUN A SHELL COMMAND
+<run_shell><command>command to run</command></run_shell>
+
+FINISH
+<task_done><summary>Brief summary of what was done and the output.</summary></task_done>
+
+## RULES
+
+Rule 1: Output EXACTLY ONE tool call per response. Never two. Never zero (unless answering a question).
+Rule 2: WAIT for the tool result before writing your next response. Never invent results.
+Rule 3: Do NOT wrap tool calls in code fences or markdown blocks.
+Rule 4: After every result, reason briefly then emit the next tool call or task_done.
+Rule 5: Every task ends with task_done.
+
+ONE CALL. WAIT. ONE CALL. WAIT. Repeat until done.
+
+## BUILDING GO PROGRAMS
+
+When asked to create and run a Go program, follow every step — do not skip any:
+
+1. Check for go.mod
+<run_shell><command>ls go.mod 2>/dev/null && echo exists || echo missing</command></run_shell>
+
+2. If output was "missing", initialise the module
+<run_shell><command>go mod init app</command></run_shell>
+
+3. Write the source file with the complete program
+<write_file><path>./main.go</path><content>
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("hello")
+}
+</content></write_file>
+
+4. Compile
+<run_shell><command>go build -o ./app .</command></run_shell>
+
+5. Run
+<run_shell><command>./app</command></run_shell>
+
+6. Report
+<task_done><summary>Built and ran the program. Output was: ...</summary></task_done>`
 
 // skillsSystemPrompt is added when skills mode is enabled
 var skillsSystemPrompt = `
@@ -126,7 +181,7 @@ type Provider string
 
 const (
         ProviderOpenRouter Provider = "openrouter"
-        ProviderChatGPT    Provider = "chatgpt"
+        ProviderOpenAI     Provider = "openai"
         ProviderAnthropic  Provider = "anthropic"
         ProviderOllama     Provider = "ollama"
         ProviderLMStudio   Provider = "lmstudio"
@@ -153,18 +208,18 @@ type Config struct {
 }
 
 func loadConfig() *Config {
-        providerStr := envOr(envProvider, string(ProviderOpenRouter))
+        providerStr := envOr(envProvider, string(ProviderOllama))
         provider := Provider(strings.ToLower(strings.TrimSpace(providerStr)))
 
         validProviders := map[Provider]bool{
                 ProviderOpenRouter: true,
-                ProviderChatGPT:    true,
+                ProviderOpenAI:    true,
                 ProviderAnthropic:  true,
                 ProviderOllama:     true,
                 ProviderLMStudio:   true,
         }
         if !validProviders[provider] {
-                fatalf("Unknown provider %q. Choose from: openrouter, chatgpt, anthropic, ollama, lmstudio", provider)
+                fatalf("Unknown provider %q. Choose from: openrouter, openai, anthropic, ollama, lmstudio", provider)
         }
 
         apiKey := resolveAPIKey(provider)
@@ -208,10 +263,10 @@ func loadConfig() *Config {
 
 func resolveAPIKey(p Provider) string {
         switch p {
-        case ProviderChatGPT:
+        case ProviderOpenAI:
                 key := strings.TrimSpace(os.Getenv(envOpenAIKey))
                 if key == "" {
-                        fatalf("ChatGPT requires %s to be set", envOpenAIKey)
+                        fatalf("OpenAI requires %s to be set", envOpenAIKey)
                 }
                 return key
         case ProviderOpenRouter:
@@ -235,8 +290,10 @@ func resolveModel(p Provider) string {
                 return m
         }
         switch p {
-        case ProviderChatGPT:
-                return defaultChatGPTModel
+        case ProviderOpenAI:
+                return defaultOpenAIModel
+        case ProviderOpenRouter:
+                return defaultOpenRouterModel
         case ProviderAnthropic:
                 return defaultAnthropicModel
         case ProviderOllama:
@@ -244,7 +301,7 @@ func resolveModel(p Provider) string {
         case ProviderLMStudio:
                 return defaultLMStudioModel
         default:
-                return defaultOpenRouterModel
+                return defaultOllamaModel
         }
 }
 
@@ -447,8 +504,21 @@ type ToolCall struct {
 }
 
 // parseToolCall scans the LLM's text for an XML tool call.
-// Returns nil if none found.
+// Tolerant of small-model quirks: code fences wrapping the XML and
+// whitespace inside tag names. Returns nil if none found.
 func parseToolCall(text string) *ToolCall {
+        if tc := parseToolCallRaw(text); tc != nil {
+                return tc
+        }
+        // Small models often wrap tool calls in ```xml...``` blocks.
+        if inner := extractCodeFenceContents(text); inner != "" {
+                return parseToolCallRaw(inner)
+        }
+        return nil
+}
+
+func parseToolCallRaw(text string) *ToolCall {
+        text = normalizeTagWhitespace(text)
         tools := []string{toolReadFile, toolWriteFile, toolRunShell, toolDone}
         for _, name := range tools {
                 open := "<" + name + ">"
@@ -460,7 +530,6 @@ func parseToolCall(text string) *ToolCall {
                 }
                 inner := text[start+len(open) : end]
                 tc := &ToolCall{Name: name, Input: map[string]string{}}
-                // Extract child tags
                 for _, field := range []string{"path", "content", "command", "summary"} {
                         if val := extractTag(inner, field); val != "" {
                                 tc.Input[field] = val
@@ -469,6 +538,35 @@ func parseToolCall(text string) *ToolCall {
                 return tc
         }
         return nil
+}
+
+var tagWhitespaceRe = regexp.MustCompile(`<(\s*/?\s*)(\w+)(\s*)>`)
+
+func normalizeTagWhitespace(text string) string {
+        return tagWhitespaceRe.ReplaceAllStringFunc(text, func(m string) string {
+                parts := tagWhitespaceRe.FindStringSubmatch(m)
+                if len(parts) < 3 {
+                        return m
+                }
+                prefix := strings.TrimSpace(parts[1])
+                return "<" + prefix + parts[2] + ">"
+        })
+}
+
+var codeFenceRe = regexp.MustCompile("(?s)```(?:xml|bash|sh|shell|json)?\n?(.*?)```")
+
+func extractCodeFenceContents(text string) string {
+        matches := codeFenceRe.FindAllStringSubmatch(text, -1)
+        if len(matches) == 0 {
+                return ""
+        }
+        var parts []string
+        for _, m := range matches {
+                if len(m) > 1 {
+                        parts = append(parts, strings.TrimSpace(m[1]))
+                }
+        }
+        return strings.Join(parts, "\n")
 }
 
 func extractTag(s, tag string) string {
@@ -493,6 +591,8 @@ type Session struct {
         autoMode     bool
         skillsMode   bool
         skillsConfig *SkillsConfig
+        cancelMu     sync.Mutex
+        cancelReq    context.CancelFunc // non-nil while an LLM request is in flight
 }
 
 func newSession(cfg *Config, auto bool, skills bool) *Session {
@@ -518,8 +618,19 @@ func (s *Session) addAssistant(content string) { s.history = append(s.history, C
 func (s *Session) clearHistory()              { s.history = nil }
 
 // send calls the LLM with the current history and returns the response.
+// Ctrl+C (SIGINT) cancels the in-flight request via signal.NotifyContext.
 func (s *Session) send() (*LLMResponse, error) {
-        return callLLM(s.cfg, s.history, s.autoMode, s.skillsMode, s.skillsConfig)
+        ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+        defer cancel()
+        s.cancelMu.Lock()
+        s.cancelReq = cancel
+        s.cancelMu.Unlock()
+        defer func() {
+                s.cancelMu.Lock()
+                s.cancelReq = nil
+                s.cancelMu.Unlock()
+        }()
+        return callLLM(ctx, s.cfg, s.history, s.autoMode, s.skillsMode, s.skillsConfig)
 }
 
 // ============================================================
@@ -584,7 +695,13 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
                         }
                 }
 
-                out, err := runShell(cmd, s.cwd, s.cfg.ShellTimeout)
+                var out string
+                var err error
+                if s.autoMode {
+                        out, err = runShellLive(cmd, s.cwd, s.cfg.ShellTimeout)
+                } else {
+                        out, err = runShell(cmd, s.cwd, s.cfg.ShellTimeout)
+                }
                 result := out
                 if err != nil {
                         result += "\n[exit error: " + err.Error() + "]"
@@ -602,10 +719,10 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
         return "", fmt.Errorf("unknown tool: %s", tc.Name)
 }
 
-// confirm asks the user to approve a tool call unless auto-approve is on.
-// Returns false if the user declines.
+// confirm asks the user to approve a tool call.
+// Auto mode and auto-approve both bypass confirmation entirely.
 func (s *Session) confirm(tc *ToolCall) bool {
-        if s.cfg.AutoApprove {
+        if s.autoMode || s.cfg.AutoApprove {
                 return true
         }
 
@@ -695,7 +812,10 @@ func (s *Session) runAutoTask() error {
                 if err != nil {
                         result = fmt.Sprintf("[tool error: %v]", err)
                 }
-                printToolResult(result)
+                // In auto mode, shell output was already streamed live — skip duplicate print.
+                if !s.autoMode || tc.Name != toolRunShell {
+                        printToolResult(result)
+                }
                 s.addUser(result)
         }
 
@@ -768,37 +888,330 @@ func (s *Session) processInlineFileRefs(text string) string {
 }
 
 // ============================================================
+// Terminal line editor — cross-platform, no build tags
+// ============================================================
+
+var errInterrupt = fmt.Errorf("interrupt")
+
+type lineReader struct {
+        history  []string
+        histFile string
+        maxHist  int
+}
+
+func newLineReader(histFile string) *lineReader {
+        lr := &lineReader{histFile: histFile, maxHist: 500}
+        lr.loadHistory()
+        return lr
+}
+
+func (lr *lineReader) close() { lr.saveHistory() }
+
+func (lr *lineReader) addToHistory(line string) {
+        if line == "" {
+                return
+        }
+        if len(lr.history) > 0 && lr.history[len(lr.history)-1] == line {
+                return
+        }
+        lr.history = append(lr.history, line)
+        if len(lr.history) > lr.maxHist {
+                lr.history = lr.history[len(lr.history)-lr.maxHist:]
+        }
+}
+
+func (lr *lineReader) loadHistory() {
+        if lr.histFile == "" {
+                return
+        }
+        data, err := os.ReadFile(lr.histFile)
+        if err != nil {
+                return
+        }
+        for _, line := range strings.Split(string(data), "\n") {
+                if line = strings.TrimRight(line, "\r"); line != "" {
+                        lr.history = append(lr.history, line)
+                }
+        }
+        if len(lr.history) > lr.maxHist {
+                lr.history = lr.history[len(lr.history)-lr.maxHist:]
+        }
+}
+
+func (lr *lineReader) saveHistory() {
+        if lr.histFile == "" || len(lr.history) == 0 {
+                return
+        }
+        _ = os.WriteFile(lr.histFile, []byte(strings.Join(lr.history, "\n")+"\n"), 0600)
+}
+
+// readLine displays prompt and reads a line with full line editing and history.
+// Returns (line, errInterrupt) on Ctrl+C, ("", io.EOF) on Ctrl+D with empty buffer.
+func (lr *lineReader) readLine(prompt string) (string, error) {
+        fd := int(os.Stdin.Fd())
+        state, err := term.MakeRaw(fd)
+        if err != nil {
+                // not a terminal or raw mode unsupported — plain buffered read
+                fmt.Print(prompt)
+                r := bufio.NewReader(os.Stdin)
+                line, err2 := r.ReadString('\n')
+                return strings.TrimRight(line, "\r\n"), err2
+        }
+        defer term.Restore(fd, state) //nolint:errcheck
+
+        fmt.Print(prompt)
+
+        var (
+                buf        []rune
+                cursor     int
+                histIdx    = len(lr.history)
+                savedInput string
+        )
+
+        redraw := func() {
+                fmt.Printf("\r%s%s\033[K", prompt, string(buf))
+                if tail := len(buf) - cursor; tail > 0 {
+                        fmt.Printf("\033[%dD", tail)
+                }
+        }
+
+        b1 := make([]byte, 1)
+        readByte := func() (byte, error) {
+                _, err := os.Stdin.Read(b1)
+                return b1[0], err
+        }
+
+        for {
+                b, err := readByte()
+                if err != nil {
+                        fmt.Print("\r\n")
+                        return string(buf), err
+                }
+
+                switch b {
+                case '\r', '\n':
+                        fmt.Print("\r\n")
+                        return string(buf), nil
+
+                case 3: // Ctrl+C
+                        fmt.Print("^C\r\n")
+                        return string(buf), errInterrupt
+
+                case 4: // Ctrl+D — forward delete or EOF on empty buffer
+                        if len(buf) == 0 {
+                                fmt.Print("\r\n")
+                                return "", io.EOF
+                        }
+                        if cursor < len(buf) {
+                                buf = append(buf[:cursor], buf[cursor+1:]...)
+                                redraw()
+                        }
+
+                case 127, 8: // Backspace / DEL
+                        if cursor > 0 {
+                                cursor--
+                                buf = append(buf[:cursor], buf[cursor+1:]...)
+                                redraw()
+                        }
+
+                case 1: // Ctrl+A — beginning of line
+                        cursor = 0
+                        redraw()
+
+                case 5: // Ctrl+E — end of line
+                        cursor = len(buf)
+                        redraw()
+
+                case 11: // Ctrl+K — kill to end
+                        buf = buf[:cursor]
+                        redraw()
+
+                case 21: // Ctrl+U — kill to beginning
+                        buf = buf[cursor:]
+                        cursor = 0
+                        redraw()
+
+                case 23: // Ctrl+W — kill word backward
+                        end := cursor
+                        for cursor > 0 && buf[cursor-1] == ' ' {
+                                cursor--
+                        }
+                        for cursor > 0 && buf[cursor-1] != ' ' {
+                                cursor--
+                        }
+                        buf = append(buf[:cursor], buf[end:]...)
+                        redraw()
+
+                case 27: // ESC — arrow keys and other sequences
+                        b2, err := readByte()
+                        if err != nil || b2 != '[' {
+                                continue
+                        }
+                        b3, err := readByte()
+                        if err != nil {
+                                continue
+                        }
+                        switch b3 {
+                        case 'A': // Up — history previous
+                                if histIdx > 0 {
+                                        if histIdx == len(lr.history) {
+                                                savedInput = string(buf)
+                                        }
+                                        histIdx--
+                                        buf = []rune(lr.history[histIdx])
+                                        cursor = len(buf)
+                                        redraw()
+                                }
+                        case 'B': // Down — history next
+                                if histIdx < len(lr.history) {
+                                        histIdx++
+                                        if histIdx == len(lr.history) {
+                                                buf = []rune(savedInput)
+                                        } else {
+                                                buf = []rune(lr.history[histIdx])
+                                        }
+                                        cursor = len(buf)
+                                        redraw()
+                                }
+                        case 'C': // Right
+                                if cursor < len(buf) {
+                                        cursor++
+                                        fmt.Print("\033[C")
+                                }
+                        case 'D': // Left
+                                if cursor > 0 {
+                                        cursor--
+                                        fmt.Print("\033[D")
+                                }
+                        case 'H': // Home
+                                cursor = 0
+                                redraw()
+                        case 'F': // End
+                                cursor = len(buf)
+                                redraw()
+                        case '1', '3', '4': // Extended: ESC [ n ~
+                                b4, err := readByte()
+                                if err != nil || b4 != '~' {
+                                        continue
+                                }
+                                switch b3 {
+                                case '1': // Home (xterm variant)
+                                        cursor = 0
+                                        redraw()
+                                case '3': // Delete
+                                        if cursor < len(buf) {
+                                                buf = append(buf[:cursor], buf[cursor+1:]...)
+                                                redraw()
+                                        }
+                                case '4': // End (xterm variant)
+                                        cursor = len(buf)
+                                        redraw()
+                                }
+                        }
+
+                default:
+                        if b < 32 {
+                                continue // ignore other control characters
+                        }
+                        // Decode UTF-8 multi-byte sequences
+                        var r rune
+                        if b < 0x80 {
+                                r = rune(b)
+                        } else {
+                                var needed int
+                                switch {
+                                case b&0xE0 == 0xC0:
+                                        needed = 1
+                                case b&0xF0 == 0xE0:
+                                        needed = 2
+                                case b&0xF8 == 0xF0:
+                                        needed = 3
+                                default:
+                                        continue // invalid UTF-8 lead byte
+                                }
+                                rest := make([]byte, needed)
+                                if _, err := io.ReadFull(os.Stdin, rest); err != nil {
+                                        continue
+                                }
+                                rr := []rune(string(append([]byte{b}, rest...)))
+                                if len(rr) == 0 {
+                                        continue
+                                }
+                                r = rr[0]
+                        }
+                        buf = append(buf, 0)
+                        copy(buf[cursor+1:], buf[cursor:])
+                        buf[cursor] = r
+                        cursor++
+                        if cursor == len(buf) {
+                                fmt.Printf("%c", r)
+                        } else {
+                                redraw()
+                        }
+                }
+        }
+}
+
+// ============================================================
 // Interactive REPL
 // ============================================================
+
+func promptStr(s *Session) string {
+        mode := ""
+        if s.autoMode && s.skillsMode {
+                mode = colorMagenta + " [auto+skills]" + colorReset
+        } else if s.autoMode {
+                mode = colorMagenta + " [auto]" + colorReset
+        } else if s.skillsMode {
+                mode = colorMagenta + " [skills]" + colorReset
+        }
+        return fmt.Sprintf("%s%sopenllm-cli%s%s %s›%s ", colorBold, colorCyan, colorReset, mode, colorDim, colorReset)
+}
 
 func runInteractive(cfg *Config, autoMode, skillsMode bool) {
         s := newSession(cfg, autoMode, skillsMode)
         printBanner(cfg, autoMode, skillsMode)
 
-        scanner := bufio.NewScanner(os.Stdin)
-        scanner.Buffer(make([]byte, 1<<20), 1<<20)
+        histFile := ""
+        if home, err := os.UserHomeDir(); err == nil {
+                histFile = home + "/.openllm-cli_history"
+        }
+        lr := newLineReader(histFile)
+        defer lr.close()
 
         for {
-                printPrompt(s)
-                if !scanner.Scan() {
-                        fmt.Printf("\n%sBye!%s\n", colorDim, colorReset)
-                        break
+                line, err := lr.readLine(promptStr(s))
+                if errors.Is(err, errInterrupt) {
+                        if strings.TrimSpace(line) == "" {
+                                fmt.Printf("%sBye!%s\n", colorDim, colorReset)
+                                return
+                        }
+                        // Ctrl+C mid-line — clear and continue
+                        continue
+                }
+                if errors.Is(err, io.EOF) {
+                        fmt.Printf("%sBye!%s\n", colorDim, colorReset)
+                        return
+                }
+                if err != nil {
+                        printError(err.Error())
+                        return
                 }
 
-                line := strings.TrimSpace(scanner.Text())
+                line = strings.TrimSpace(line)
                 if line == "" {
                         continue
                 }
 
-                // Slash commands
                 if strings.HasPrefix(line, "/") {
-                        if quit := s.handleSlashCommand(line, scanner); quit {
+                        if quit := s.handleSlashCommand(line); quit {
                                 break
                         }
                         continue
                 }
 
-                // Expand inline @file and `backtick` references
+                lr.addToHistory(line)
+
                 expanded, err := expandInline(line, cfg)
                 if err != nil {
                         printError(err.Error())
@@ -809,22 +1222,29 @@ func runInteractive(cfg *Config, autoMode, skillsMode bool) {
 
                 if autoMode {
                         if err := s.runAutoTask(); err != nil {
-                                printError(err.Error())
+                                if errors.Is(err, context.Canceled) {
+                                        fmt.Printf("\n%s[interrupted]%s\n", colorYellow, colorReset)
+                                        s.history = s.history[:len(s.history)-1]
+                                } else {
+                                        printError(err.Error())
+                                }
                         }
                 } else {
                         resp, err := s.send()
                         if err != nil {
-                                printError(err.Error())
-                                s.history = s.history[:len(s.history)-1] // roll back
+                                if errors.Is(err, context.Canceled) {
+                                        fmt.Printf("\n%s[interrupted]%s\n", colorYellow, colorReset)
+                                } else {
+                                        printError(err.Error())
+                                }
+                                s.history = s.history[:len(s.history)-1]
                                 continue
                         }
 
-                        // Process skills inline commands if skills mode is enabled
                         responseText := resp.Text
                         if skillsMode {
                                 responseText = s.processSkillsInline(resp.Text)
                         }
-
                         printAssistant(cfg, responseText)
                         s.addAssistant(responseText)
                 }
@@ -836,7 +1256,7 @@ func runInteractive(cfg *Config, autoMode, skillsMode bool) {
 // Slash commands
 // ============================================================
 
-func (s *Session) handleSlashCommand(line string, scanner *bufio.Scanner) (quit bool) {
+func (s *Session) handleSlashCommand(line string) (quit bool) {
         parts := strings.SplitN(line, " ", 2)
         cmd := strings.ToLower(parts[0])
         arg := ""
@@ -922,14 +1342,14 @@ func (s *Session) handleSlashCommand(line string, scanner *bufio.Scanner) (quit 
                         printError("Usage: /read <path>")
                         break
                 }
-                s.cmdRead(arg, scanner)
+                s.cmdRead(arg)
 
         case "/write":
                 if arg == "" {
                         printError("Usage: /write <path>")
                         break
                 }
-                s.cmdWrite(arg, scanner)
+                s.cmdWrite(arg)
 
         case "/ls":
                 dir := s.cwd
@@ -965,7 +1385,7 @@ func (s *Session) handleSlashCommand(line string, scanner *bufio.Scanner) (quit 
                         printError("Usage: /run <command>")
                         break
                 }
-                s.cmdRun(arg, scanner)
+                s.cmdRun(arg)
 
         case "/help":
                 printCommandHelp()
@@ -978,7 +1398,7 @@ func (s *Session) handleSlashCommand(line string, scanner *bufio.Scanner) (quit 
 }
 
 // cmdRead reads a file/dir and optionally sends it to the LLM.
-func (s *Session) cmdRead(path string, scanner *bufio.Scanner) {
+func (s *Session) cmdRead(path string) {
         abs := filepath.Join(s.cwd, path)
 
         // Skills mode validation
@@ -996,8 +1416,8 @@ func (s *Session) cmdRead(path string, scanner *bufio.Scanner) {
         }
         fmt.Printf("%s── %s ──%s\n%s\n%s────%s\n", colorDim, path, colorReset, content, colorDim, colorReset)
 
-        if askYN(scanner, "Send to LLM?") {
-                prompt := askLine(scanner, "Add a message (or Enter to just send the file):")
+        if askYN("Send to LLM?") {
+                prompt := askLine("Add a message (or Enter to just send the file):")
                 msg := fmt.Sprintf("[File: %s]\n```\n%s\n```", path, content)
                 if prompt != "" {
                         msg = prompt + "\n\n" + msg
@@ -1008,7 +1428,7 @@ func (s *Session) cmdRead(path string, scanner *bufio.Scanner) {
 }
 
 // cmdWrite writes content to a file. Uses last assistant reply if no content typed.
-func (s *Session) cmdWrite(path string, scanner *bufio.Scanner) {
+func (s *Session) cmdWrite(path string) {
         abs := filepath.Join(s.cwd, path)
 
         // Skills mode validation
@@ -1024,8 +1444,8 @@ func (s *Session) cmdWrite(path string, scanner *bufio.Scanner) {
         if content == "" {
                 fmt.Printf("%sEnter content (end with a single '.' on its own line):%s\n", colorDim, colorReset)
                 var lines []string
-                for scanner.Scan() {
-                        l := scanner.Text()
+                for {
+                        l := stdinReadLine()
                         if l == "." {
                                 break
                         }
@@ -1035,7 +1455,7 @@ func (s *Session) cmdWrite(path string, scanner *bufio.Scanner) {
         }
 
         if !s.cfg.AutoApprove {
-                if !askYN(scanner, fmt.Sprintf("Write %d bytes to %s?", len(content), path)) {
+                if !askYN(fmt.Sprintf("Write %d bytes to %s?", len(content), path)) {
                         infof("Cancelled.")
                         return
                 }
@@ -1048,7 +1468,7 @@ func (s *Session) cmdWrite(path string, scanner *bufio.Scanner) {
 }
 
 // cmdRun executes a shell command and optionally sends output to the LLM.
-func (s *Session) cmdRun(cmd string, scanner *bufio.Scanner) {
+func (s *Session) cmdRun(cmd string) {
         // Skills mode validation
         if s.skillsMode && s.skillsConfig != nil {
                 if !s.skillsConfig.isCommandAllowed(cmd) {
@@ -1059,7 +1479,7 @@ func (s *Session) cmdRun(cmd string, scanner *bufio.Scanner) {
 
         if !s.cfg.AutoApprove {
                 fmt.Printf("%s%s⚠  Run: %s%s\n", colorBold, colorYellow, colorReset, cmd)
-                if !askYN(scanner, "Confirm?") {
+                if !askYN("Confirm?") {
                         infof("Cancelled.")
                         return
                 }
@@ -1073,8 +1493,8 @@ func (s *Session) cmdRun(cmd string, scanner *bufio.Scanner) {
         }
         fmt.Printf("%s── output ──%s\n%s\n%s────%s\n", colorDim, colorReset, out, colorDim, colorReset)
 
-        if askYN(scanner, "Send output to LLM?") {
-                question := askLine(scanner, "What should I do with this? (or Enter to just send):")
+        if askYN("Send output to LLM?") {
+                question := askLine("What should I do with this? (or Enter to just send):")
                 msg := fmt.Sprintf("[Command: `%s`]\n```\n%s\n```", cmd, out)
                 if question != "" {
                         msg = question + "\n\n" + msg
@@ -1283,9 +1703,9 @@ func runShell(cmd, cwd string, timeout time.Duration) (string, error) {
 
         var c *exec.Cmd
         if runtime.GOOS == "windows" {
-                c = exec.CommandContext(ctx, "cmd", "/C", cmd)
+                c = exec.CommandContext(ctx, "cmd", "/C", cmd) //nolint:gosec
         } else {
-                c = exec.CommandContext(ctx, "sh", "-c", cmd)
+                c = exec.CommandContext(ctx, "sh", "-c", cmd) //nolint:gosec
         }
         if cwd != "" {
                 c.Dir = cwd
@@ -1303,16 +1723,45 @@ func runShell(cmd, cwd string, timeout time.Duration) (string, error) {
         return strings.TrimRight(buf.String(), "\n"), err
 }
 
+// runShellLive streams command output to the terminal in real time (auto mode).
+func runShellLive(cmd, cwd string, timeout time.Duration) (string, error) {
+        ctx, cancel := context.WithTimeout(context.Background(), timeout)
+        defer cancel()
+
+        var c *exec.Cmd
+        if runtime.GOOS == "windows" {
+                c = exec.CommandContext(ctx, "cmd", "/C", cmd) //nolint:gosec
+        } else {
+                c = exec.CommandContext(ctx, "sh", "-c", cmd) //nolint:gosec
+        }
+        if cwd != "" {
+                c.Dir = cwd
+        }
+
+        var buf bytes.Buffer
+        c.Stdout = io.MultiWriter(os.Stdout, &buf)
+        c.Stderr = io.MultiWriter(os.Stderr, &buf)
+
+        fmt.Printf("%s", colorDim)
+        err := c.Run()
+        fmt.Printf("%s", colorReset)
+
+        if ctx.Err() == context.DeadlineExceeded {
+                return buf.String(), fmt.Errorf("timed out after %v", timeout)
+        }
+        return strings.TrimRight(buf.String(), "\n"), err
+}
+
 // ============================================================
 // LLM client — unified interface across all providers
 // ============================================================
 
-func callLLM(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+func callLLM(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
         switch cfg.Provider {
         case ProviderAnthropic:
-                return callAnthropic(cfg, history, autoMode, skillsMode, skillsConfig)
+                return callAnthropic(ctx, cfg, history, autoMode, skillsMode, skillsConfig)
         default:
-                return callOpenAICompat(cfg, history, autoMode, skillsMode, skillsConfig)
+                return callOpenAICompat(ctx, cfg, history, autoMode, skillsMode, skillsConfig)
         }
 }
 
@@ -1350,7 +1799,7 @@ func buildOpenAIMessages(cfg *Config, history []ChatMessage, autoMode, skillsMod
         return msgs
 }
 
-// ---- OpenAI-compatible (OpenRouter, ChatGPT, Ollama, LM Studio) ----
+// ---- OpenAI-compatible (OpenRouter, OpenAI, Ollama, LM Studio) ----
 
 type openAIRequest struct {
         Model    string        `json:"model"`
@@ -1379,11 +1828,12 @@ type ollamaResponse struct {
         Error string `json:"error,omitempty"`
 }
 
-func callOpenAICompat(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
-        msgs := buildOpenAIMessages(cfg, history, autoMode, skillsMode, skillsConfig)
+func callOpenAICompat(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+        if cfg.Provider == ProviderOllama {
+                return callOllama(ctx, cfg, history, autoMode, skillsMode, skillsConfig)
+        }
 
-        // If history already contains a system message (from auto mode), don't prepend again.
-        // Check if the first message is already "system" role.
+        msgs := buildOpenAIMessages(cfg, history, autoMode, skillsMode, skillsConfig)
         if len(history) > 0 && history[0].Role == "system" {
                 msgs = history
         }
@@ -1391,14 +1841,10 @@ func callOpenAICompat(cfg *Config, history []ChatMessage, autoMode, skillsMode b
         apiURL := cfg.apiURL()
         body := openAIRequest{Model: cfg.Model, Messages: msgs, Stream: cfg.Stream}
 
-        if cfg.Provider == ProviderOllama {
-                return callOllama(cfg, history, autoMode, skillsMode, skillsConfig)
-        }
-
-        return doOpenAIRequest(cfg, apiURL, body)
+        return doOpenAIRequest(ctx, cfg, apiURL, body)
 }
 
-func doOpenAIRequest(cfg *Config, apiURL string, body openAIRequest) (*LLMResponse, error) {
+func doOpenAIRequest(ctx context.Context, cfg *Config, apiURL string, body openAIRequest) (*LLMResponse, error) {
         data, err := json.Marshal(body)
         if err != nil {
                 return nil, err
@@ -1406,7 +1852,7 @@ func doOpenAIRequest(cfg *Config, apiURL string, body openAIRequest) (*LLMRespon
 
         debugf(cfg, "POST %s  model=%s  messages=%d", apiURL, body.Model, len(body.Messages))
 
-        ctx, cancel := context.WithTimeout(context.Background(), cfg.LLMTimeout)
+        ctx, cancel := context.WithTimeout(ctx, cfg.LLMTimeout)
         defer cancel()
 
         req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(data))
@@ -1502,7 +1948,7 @@ func streamOpenAIResponse(cfg *Config, resp *http.Response) (*LLMResponse, error
 
 // ---- Ollama (uses same format but different streaming protocol) ----
 
-func callOllama(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+func callOllama(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
         msgs := buildOpenAIMessages(cfg, history, autoMode, skillsMode, skillsConfig)
         if len(history) > 0 && history[0].Role == "system" {
                 msgs = history
@@ -1517,7 +1963,7 @@ func callOllama(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, s
 
         debugf(cfg, "POST %s  model=%s", cfg.OllamaURL, cfg.Model)
 
-        ctx, cancel := context.WithTimeout(context.Background(), cfg.LLMTimeout)
+        ctx, cancel := context.WithTimeout(ctx, cfg.LLMTimeout)
         defer cancel()
 
         req, err := http.NewRequestWithContext(ctx, "POST", cfg.OllamaURL, bytes.NewReader(data))
@@ -1603,7 +2049,7 @@ type anthropicSSE struct {
         } `json:"error,omitempty"`
 }
 
-func callAnthropic(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+func callAnthropic(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
         // Anthropic puts system at the top level, not as a message
         sys := buildSystemPrompt(cfg, autoMode, skillsMode, skillsConfig)
         msgs := make([]ChatMessage, 0, len(history))
@@ -1631,7 +2077,7 @@ func callAnthropic(cfg *Config, history []ChatMessage, autoMode, skillsMode bool
         data, _ := json.Marshal(body)
         debugf(cfg, "POST %s  model=%s  max_tokens=%d", anthropicURL, cfg.Model, cfg.MaxTokens)
 
-        ctx, cancel := context.WithTimeout(context.Background(), cfg.LLMTimeout)
+        ctx, cancel := context.WithTimeout(ctx, cfg.LLMTimeout)
         defer cancel()
 
         req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewReader(data))
@@ -1712,11 +2158,13 @@ done:
 
 func (cfg *Config) apiURL() string {
         switch cfg.Provider {
-        case ProviderChatGPT:
-                return chatGPTURL
+        case ProviderOpenAI:
+                return openAIURL
+        case ProviderOpenRouter:
+                return openRouterURL
         case ProviderLMStudio:
                 return cfg.LMStudioURL
-        default: // OpenRouter
+        default:
                 return openRouterURL
         }
 }
@@ -1825,8 +2273,8 @@ func printBanner(cfg *Config, autoMode, skillsMode bool) {
                 }
         }
         wd, _ := os.Getwd()
-        fmt.Printf("\n%s%s openllm-cli%s  %s%s · %s · %s%s\n",
-                colorBold, colorCyan, colorReset,
+        fmt.Printf("\n%s%s openllm-cli %s%s  %s%s · %s · %s%s\n",
+                colorBold, colorCyan, version, colorReset,
                 colorDim, cfg.Provider, cfg.Model, mode, colorReset,
         )
         fmt.Printf("%scwd: %s%s\n", colorDim, wd, colorReset)
@@ -1838,18 +2286,6 @@ func printBanner(cfg *Config, autoMode, skillsMode bool) {
         helpText += " · /exit to quit"
 
         fmt.Printf("%s%s%s\n\n", colorDim, helpText, colorReset)
-}
-
-func printPrompt(s *Session) {
-        mode := ""
-        if s.autoMode && s.skillsMode {
-                mode = colorMagenta + " [auto+skills]" + colorReset
-        } else if s.autoMode {
-                mode = colorMagenta + " [auto]" + colorReset
-        } else if s.skillsMode {
-                mode = colorMagenta + " [skills]" + colorReset
-        }
-        fmt.Printf("%s%sopenllm-cli%s%s %s›%s ", colorBold, colorCyan, colorReset, mode, colorDim, colorReset)
 }
 
 func printAssistant(cfg *Config, text string) {
@@ -1964,7 +2400,8 @@ func printCommandHelp() {
         fmt.Printf("%sAuto mode%s — the LLM can use tools autonomously:\n", colorBold, colorReset)
         fmt.Printf("  Start with %s-a%s / %s--auto%s, or type %s/auto%s to toggle.\n", colorYellow, colorReset, colorYellow, colorReset, colorYellow, colorReset)
         fmt.Printf("  Tools: read_file · write_file · run_shell\n")
-        fmt.Printf("  Each tool action requires confirmation unless %sLLM_AUTO_APPROVE=1%s.\n\n", colorYellow, colorReset)
+        fmt.Printf("  All tool actions run without confirmation in auto mode.\n")
+        fmt.Printf("  Set %sLLM_AUTO_APPROVE=1%s to skip confirmations in non-auto modes.\n\n", colorYellow, colorReset)
 
         fmt.Printf("%sExamples%s\n", colorBold, colorReset)
         fmt.Printf("  openllm-cli > review @./main.go and list any bugs\n")
@@ -1992,26 +2429,26 @@ Interactive LLM CLI with filesystem access, auto mode, and skills integration.
   -h, --help          show this help
 
 %sEnvironment:%s
-  LLM_PROVIDER         openrouter* | chatgpt | anthropic | ollama | lmstudio
+  LLM_PROVIDER         ollama* | openrouter | openai | anthropic | lmstudio
   LLM_MODEL            model name (provider default used if unset)
   LLM_STREAM           1/true to enable streaming tokens
   LLM_SYSTEM_PROMPT    system prompt
   LLM_MAX_TOKENS       max tokens to generate (default %d)
   LLM_TIMEOUT          LLM request timeout seconds (default 120 / 300 streaming)
-  LLM_SHELL_TIMEOUT    shell command timeout seconds (default 30)
+  LLM_SHELL_TIMEOUT    shell command timeout seconds (default 60)
   LLM_AUTO_APPROVE     1/true to skip tool-use confirmations
   LLM_SKILLS_MODE      1/true to enable skills mode by default
   LLM_VERBOSE          1/true for debug logging
 
   OPENROUTER_API_KEY   required for openrouter
-  OPENAI_API_KEY       required for chatgpt
+  OPENAI_API_KEY       required for openai
   ANTHROPIC_API_KEY    required for anthropic
   OLLAMA_URL           ollama endpoint (default %s)
   LM_STUDIO_URL        lm studio endpoint (default %s)
 
 %sModel defaults:%s
   openrouter   %s
-  chatgpt      %s
+  openai       %s
   anthropic    %s
   ollama       %s
   lmstudio     %s
@@ -2034,7 +2471,7 @@ Interactive LLM CLI with filesystem access, auto mode, and skills integration.
                 defaultLMStudioURL,
                 colorBold, colorReset,
                 defaultOpenRouterModel,
-                defaultChatGPTModel,
+                defaultOpenAIModel,
                 defaultAnthropicModel,
                 defaultOllamaModel,
                 defaultLMStudioModel,
@@ -2063,18 +2500,19 @@ func fatalf(format string, args ...interface{}) {
         os.Exit(1)
 }
 
-func askYN(scanner *bufio.Scanner, prompt string) bool {
-        fmt.Printf("%s%s [y/N]%s ", colorDim, prompt, colorReset)
-        if !scanner.Scan() {
-                return false
-        }
-        return strings.ToLower(strings.TrimSpace(scanner.Text())) == "y"
+// stdinReadLine reads one line from stdin in cooked mode (used for sub-prompts).
+func stdinReadLine() string {
+        r := bufio.NewReader(os.Stdin)
+        line, _ := r.ReadString('\n')
+        return strings.TrimRight(line, "\r\n")
 }
 
-func askLine(scanner *bufio.Scanner, prompt string) string {
+func askYN(prompt string) bool {
+        fmt.Printf("%s%s [y/N]%s ", colorDim, prompt, colorReset)
+        return strings.ToLower(stdinReadLine()) == "y"
+}
+
+func askLine(prompt string) string {
         fmt.Printf("%s%s%s ", colorDim, prompt, colorReset)
-        if !scanner.Scan() {
-                return ""
-        }
-        return strings.TrimSpace(scanner.Text())
+        return stdinReadLine()
 }
