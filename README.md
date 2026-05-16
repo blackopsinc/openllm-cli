@@ -5,11 +5,12 @@ An interactive LLM CLI with filesystem access, autonomous tool use, and skills i
 ## Features
 
 - **Interactive REPL** — multi-turn conversation with history, slash commands, and inline file/command injection
-- **Auto mode** — fully autonomous: the LLM reads/writes files and runs shell commands without prompting
+- **Auto mode** — fully autonomous: the LLM reads/writes files and runs shell commands to complete any task
 - **Skills mode** — controlled execution driven by a `SKILL.md` file in your working directory
 - **Pipe mode** — single-shot stdin → stdout for scripting and shell pipelines
-- **Streaming** — real-time token output and live shell command streaming in auto mode
+- **Streaming** — real-time token output in chat mode; tool actions streamed live in auto mode
 - **Multi-provider** — one binary, five backends
+- **Small-model friendly** — tolerant XML parsing handles common output quirks from local models
 
 ## Installation
 
@@ -43,14 +44,16 @@ source env/environment_ollama      # sets LLM_PROVIDER=ollama + model
 openllm-cli                        # starts the REPL
 ```
 
-### Auto mode — create a Go app
+### Auto mode — any task
 
 ```bash
 openllm-cli -a
-> create a CLI tool in Go that prints a Fibonacci sequence, compile it, and run it
+> do research on the top 5 Go web frameworks and write a comparison to frameworks.md
+> create a REST API in Go that reads from a CSV file
+> find all TODO comments in this repo and list them
 ```
 
-The agent will write the source file(s) to your working directory, run `go build`, execute the binary, and show you the output — no prompts, no confirmation steps.
+The agent uses shell commands, reads and writes files, and reports what it did — no prompts, no confirmation steps.
 
 ### Pipe mode
 
@@ -82,7 +85,7 @@ git diff | openllm-cli
 | `LLM_SHELL_TIMEOUT` | `60` | Shell command timeout (seconds) |
 | `LLM_AUTO_APPROVE` | `false` | Skip tool confirmations in non-auto modes |
 | `LLM_SKILLS_MODE` | `false` | Enable skills mode by default |
-| `LLM_VERBOSE` | `false` | Debug logging |
+| `LLM_VERBOSE` | `false` | Debug logging (shows requests, model responses, parsing details) |
 | `LLM_INTERACTIVE` | `false` | Force interactive REPL even when stdin is piped |
 | `OPENROUTER_API_KEY` | — | Required for `openrouter` |
 | `OPENAI_API_KEY` | — | Required for `openai` |
@@ -193,18 +196,52 @@ Examples:
 > `go test ./...` what do these failures mean?
 ```
 
-## Auto Mode — Go Development
+## Auto Mode
 
-In auto mode (`-a`), the agent follows this workflow automatically when asked to build a Go program:
+Auto mode (`-a`) lets the model complete tasks by reading/writing files and running shell commands. It works for any kind of task — research, file manipulation, code, data processing, system inspection:
 
-1. Check whether `go.mod` exists in the working directory
-2. Run `go mod init app` if missing
-3. Write the Go source file(s) to the working directory
-4. Run `go build -o ./app .`
-5. Run `./app` and show the output
-6. Report what was built
+```
+> do research on quantum computing and write a summary to research.md
+> create a REST API in Go that reads from data.csv
+> find all .log files older than 7 days and delete them
+> what Go packages does this project import?
+```
 
-Shell output streams to your terminal in real time during steps 4 and 5.
+### What you see
+
+Raw XML tool calls are never shown. Instead, each action is displayed as a clean line:
+
+```
+ 📖  read ./main.go
+ ✏️   write ./output.md  (1.2 KB)
+ ⚙️   go build -o ./app .
+ ✓ Done  Built and ran the app. Output was: Hello, world!
+```
+
+Shell commands stream output to the terminal in real time. When streaming is enabled (`LLM_STREAM=1`), the model's reasoning is buffered silently in auto mode to avoid showing raw tool-call XML — only the formatted tool actions appear.
+
+### Approach
+
+The agent picks the right approach for the task:
+- **Research / fetch data** — `curl`, `grep`, `jq` via shell
+- **Read or summarise files** — `read_file`, then answer
+- **Write or edit files** — `write_file`
+- **System tasks** — shell commands
+- **Write and run code** — only when explicitly asked
+
+### Loop protection
+
+If the model gets stuck repeating the same error (e.g. a malformed tool call), the loop breaks after 3 identical results and reports what went wrong. This prevents runaway inference on low-capability models.
+
+## Non-Auto Mode
+
+In regular chat mode, if the model outputs a tool call (some models do this regardless of instructions), the raw XML is stripped from the display. You'll see a hint instead:
+
+```
+[Model wants to use tools — type /auto or restart with -a to enable auto mode]
+```
+
+Any prose the model wrote before the tool call is shown normally.
 
 ## Skills Mode
 
@@ -221,6 +258,28 @@ You are a Go development assistant. Help the user build and test Go code.
 ```
 
 Start with `openllm-cli -s` or toggle with `/skills` in the REPL. When `AUTO_EXECUTE: true` is set, allowed commands run without confirmation.
+
+## Small Model Compatibility
+
+The tool parser handles common output quirks from smaller local models:
+
+- **Missing inner tags** — `<run_shell>ls -la</run_shell>` works the same as `<run_shell><command>ls -la</command></run_shell>`
+- **Code-fenced tool calls** — tool calls wrapped in ` ```xml ` blocks are extracted automatically
+- **Whitespace in tag names** — `< run_shell >` is normalised to `<run_shell>`
+- **Helpful error feedback** — when a required field is missing, the error returned to the model includes the correct format so it can self-correct
+
+For best results with small models, use a non-streaming setup (`LLM_STREAM=0`) and set `LLM_VERBOSE=true` to see exactly what the model is outputting if something goes wrong.
+
+## Debugging
+
+Set `LLM_VERBOSE=true` to log:
+- Every HTTP request (URL, model, message count)
+- Streaming JSON parse errors
+- Tool call parsing decisions
+
+```bash
+LLM_VERBOSE=true openllm-cli -a
+```
 
 ## Security
 

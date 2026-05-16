@@ -129,44 +129,24 @@ FINISH
 
 ## RULES
 
-Rule 1: Output EXACTLY ONE tool call per response. Never two. Never zero (unless answering a question).
+Rule 1: Output EXACTLY ONE tool call per response. Never two in one response. If the user asks a direct question that needs no file or shell access, answer in plain text with no tool call and no task_done.
 Rule 2: WAIT for the tool result before writing your next response. Never invent results.
 Rule 3: Do NOT wrap tool calls in code fences or markdown blocks.
 Rule 4: After every result, reason briefly then emit the next tool call or task_done.
 Rule 5: Every task ends with task_done.
-Rule 6: Shell output is capped at ~12 KB. For web pages or large files, pipe through grep/head/sed to extract only what you need. Example: curl -s URL | grep -i "headline\|title" | head -40
+Rule 6: Shell output is capped at ~12 KB. For web pages or large files, pipe through grep/head/sed to extract only what you need. Example: curl -s URL | grep -i "keyword" | head -40
+Rule 7: Use the simplest tool for the job. Research → curl/grep. File tasks → read_file/write_file. System info → run_shell. Do NOT write programs to solve tasks that shell commands can handle directly.
 
 ONE CALL. WAIT. ONE CALL. WAIT. Repeat until done.
 
-## BUILDING GO PROGRAMS
+## APPROACH
 
-When asked to create and run a Go program, follow every step — do not skip any:
-
-1. Check for go.mod
-<run_shell><command>ls go.mod 2>/dev/null && echo exists || echo missing</command></run_shell>
-
-2. If output was "missing", initialise the module
-<run_shell><command>go mod init app</command></run_shell>
-
-3. Write the source file with the complete program
-<write_file><path>./main.go</path><content>
-package main
-
-import "fmt"
-
-func main() {
-    fmt.Println("hello")
-}
-</content></write_file>
-
-4. Compile
-<run_shell><command>go build -o ./app .</command></run_shell>
-
-5. Run
-<run_shell><command>./app</command></run_shell>
-
-6. Report
-<task_done><summary>Built and ran the program. Output was: ...</summary></task_done>`
+Match your approach to the task:
+- Research / fetch data: use curl, grep, jq, awk directly in run_shell
+- Read or summarise files: use read_file, then task_done with your analysis
+- Write or edit files: use write_file
+- System tasks: use run_shell with the appropriate system command
+- Only write and compile code when the user explicitly asks for a program`
 
 // skillsSystemPrompt is added when skills mode is enabled
 var skillsSystemPrompt = `
@@ -522,12 +502,22 @@ func parseToolCall(text string) *ToolCall {
 func parseToolCallRaw(text string) *ToolCall {
         text = normalizeTagWhitespace(text)
         tools := []string{toolReadFile, toolWriteFile, toolRunShell, toolDone}
+
+        // Pick the tool whose opening tag appears earliest in the text, so that if a
+        // model emits two tool calls we always take the first one regardless of which
+        // tool type it is (the iteration order of 'tools' must not determine priority).
+        bestStart := -1
+        var best *ToolCall
+
         for _, name := range tools {
                 open := "<" + name + ">"
                 close := "</" + name + ">"
                 start := strings.Index(text, open)
                 end := strings.Index(text, close)
                 if start == -1 || end == -1 || end <= start {
+                        continue
+                }
+                if bestStart != -1 && start >= bestStart {
                         continue
                 }
                 inner := text[start+len(open) : end]
@@ -537,9 +527,20 @@ func parseToolCallRaw(text string) *ToolCall {
                                 tc.Input[field] = val
                         }
                 }
-                return tc
+                // Fallback for small models that omit the inner tag:
+                // <run_shell>ls -la</run_shell> instead of <run_shell><command>ls -la</command></run_shell>
+                // <task_done>summary text</task_done> instead of <task_done><summary>...</summary></task_done>
+                innerTrimmed := strings.TrimSpace(inner)
+                if name == toolRunShell && tc.Input["command"] == "" && innerTrimmed != "" {
+                        tc.Input["command"] = innerTrimmed
+                }
+                if name == toolDone && tc.Input["summary"] == "" && innerTrimmed != "" {
+                        tc.Input["summary"] = innerTrimmed
+                }
+                bestStart = start
+                best = tc
         }
-        return nil
+        return best
 }
 
 var tagWhitespaceRe = regexp.MustCompile(`<(\s*/?\s*)(\w+)(\s*)>`)
@@ -569,6 +570,22 @@ func extractCodeFenceContents(text string) string {
                 }
         }
         return strings.Join(parts, "\n")
+}
+
+// stripToolCallXML removes the tool-call XML block from text, leaving only prose.
+func stripToolCallXML(text string) string {
+        tools := []string{toolReadFile, toolWriteFile, toolRunShell, toolDone}
+        for _, name := range tools {
+                open := "<" + name + ">"
+                close := "</" + name + ">"
+                start := strings.Index(text, open)
+                end := strings.Index(text, close)
+                if start == -1 || end == -1 {
+                        continue
+                }
+                return strings.TrimSpace(text[:start] + text[end+len(close):])
+        }
+        return text
 }
 
 func extractTag(s, tag string) string {
@@ -667,7 +684,10 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
                 path := tc.Input["path"]
                 content := tc.Input["content"]
                 if path == "" {
-                        return "", fmt.Errorf("write_file: missing <path>")
+                        return "[write_file error: missing <path> tag. Correct format: <write_file><path>./filename.ext</path><content>\nfile contents\n</content></write_file>]", nil
+                }
+                if strings.TrimSpace(content) == "" {
+                        return fmt.Sprintf("[write_file error: missing <content> tag or empty content for %s. Include the full file content between <content>...</content> tags]", path), nil
                 }
 
                 // Skills mode validation
@@ -687,7 +707,7 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
         case toolRunShell:
                 cmd := tc.Input["command"]
                 if cmd == "" {
-                        return "", fmt.Errorf("run_shell: missing <command>")
+                        return "[run_shell error: missing <command> tag. Correct format: <run_shell><command>your command here</command></run_shell>]", nil
                 }
 
                 // Skills mode validation
@@ -774,12 +794,25 @@ func (s *Session) confirm(tc *ToolCall) bool {
 // runAutoTask runs a single task through the tool-use loop.
 // The user's message is already in s.history when this is called.
 func (s *Session) runAutoTask() error {
-        const maxRounds = 20
+        const maxRounds = 2024
+        const maxConsecutiveErrors = 3
+        lastResult := ""
+        consecutiveErrors := 0
 
         for round := 0; round < maxRounds; round++ {
                 resp, err := s.send()
                 if err != nil {
                         return fmt.Errorf("LLM error: %w", err)
+                }
+
+                // Parse tool call first so we know what to display
+                tc := parseToolCall(resp.Text)
+
+                // task_done — print summary only, skip showing raw XML response
+                if tc != nil && tc.Name == toolDone {
+                        s.addAssistant(resp.Text)
+                        fmt.Printf("\n%s✓ Done%s  %s\n\n", colorGreen+colorBold, colorReset, tc.Input["summary"])
+                        return nil
                 }
 
                 // Process skills inline commands and file references before printing
@@ -788,21 +821,18 @@ func (s *Session) runAutoTask() error {
                         processedText = s.processSkillsInline(resp.Text)
                 }
 
-                // Print the LLM's text response
-                printAssistant(s.cfg, processedText)
+                // Strip the tool call XML from display text to avoid raw XML in output
+                displayText := processedText
+                if tc != nil {
+                        displayText = stripToolCallXML(processedText)
+                }
+                if strings.TrimSpace(displayText) != "" {
+                        printAssistant(s.cfg, displayText)
+                }
                 s.addAssistant(processedText)
 
-                // Look for a tool call in the original response (not processed)
-                tc := parseToolCall(resp.Text)
                 if tc == nil {
                         debugf(s.cfg, "no tool call detected in response (round %d)", round+1)
-                        // No tool call — conversation turn complete
-                        return nil
-                }
-
-                // task_done signals we're finished
-                if tc.Name == toolDone {
-                        fmt.Printf("\n%s✓ Done%s  %s\n\n", colorGreen+colorBold, colorReset, tc.Input["summary"])
                         return nil
                 }
 
@@ -818,6 +848,18 @@ func (s *Session) runAutoTask() error {
                 if err != nil {
                         result = fmt.Sprintf("[tool error: %v]", err)
                 }
+
+                // Break if the model is stuck repeating the same error
+                if result == lastResult {
+                        consecutiveErrors++
+                        if consecutiveErrors >= maxConsecutiveErrors {
+                                return fmt.Errorf("model stuck: same result %d times in a row: %s", consecutiveErrors, result)
+                        }
+                } else {
+                        consecutiveErrors = 0
+                        lastResult = result
+                }
+
                 // In auto mode, shell output was already streamed live — skip duplicate print.
                 if !s.autoMode || tc.Name != toolRunShell {
                         printToolResult(result)
@@ -1251,7 +1293,7 @@ func runInteractive(cfg *Config, autoMode, skillsMode bool) {
                         if s.skillsMode {
                                 responseText = s.processSkillsInline(resp.Text)
                         }
-                        printAssistant(cfg, responseText)
+                        s.printChatResponse(responseText)
                         s.addAssistant(responseText)
                 }
                 fmt.Println()
@@ -1524,16 +1566,28 @@ func (s *Session) dispatchLLM() {
                         return
                 }
 
-                // Process skills inline commands if skills mode is enabled
                 responseText := resp.Text
                 if s.skillsMode {
                         responseText = s.processSkillsInline(resp.Text)
                 }
-
-                printAssistant(s.cfg, responseText)
+                s.printChatResponse(responseText)
                 s.addAssistant(responseText)
         }
         fmt.Println()
+}
+
+// printChatResponse handles displaying an LLM response in non-auto mode.
+// It strips any tool-call XML the model may have emitted and shows a hint
+// pointing the user toward auto mode when the entire response was a tool call.
+func (s *Session) printChatResponse(text string) {
+        displayText := stripToolCallXML(text)
+        if strings.TrimSpace(displayText) == "" {
+                if parseToolCall(text) != nil {
+                        fmt.Printf("%s[Model wants to use tools — type /auto or restart with -a to enable auto mode]%s\n", colorYellow, colorReset)
+                }
+                return
+        }
+        printAssistant(s.cfg, displayText)
 }
 
 func (s *Session) lastAssistantReply() string {
@@ -1847,10 +1901,10 @@ func callOpenAICompat(ctx context.Context, cfg *Config, history []ChatMessage, a
         apiURL := cfg.apiURL()
         body := openAIRequest{Model: cfg.Model, Messages: msgs, Stream: cfg.Stream}
 
-        return doOpenAIRequest(ctx, cfg, apiURL, body)
+        return doOpenAIRequest(ctx, cfg, apiURL, body, autoMode)
 }
 
-func doOpenAIRequest(ctx context.Context, cfg *Config, apiURL string, body openAIRequest) (*LLMResponse, error) {
+func doOpenAIRequest(ctx context.Context, cfg *Config, apiURL string, body openAIRequest, autoMode bool) (*LLMResponse, error) {
         data, err := json.Marshal(body)
         if err != nil {
                 return nil, err
@@ -1883,7 +1937,7 @@ func doOpenAIRequest(ctx context.Context, cfg *Config, apiURL string, body openA
         if !cfg.Stream {
                 return parseOpenAIResponse(resp)
         }
-        return streamOpenAIResponse(cfg, resp)
+        return streamOpenAIResponse(cfg, resp, autoMode)
 }
 
 func parseOpenAIResponse(resp *http.Response) (*LLMResponse, error) {
@@ -1911,7 +1965,7 @@ func parseOpenAIResponse(resp *http.Response) (*LLMResponse, error) {
         return &LLMResponse{Text: r.Choices[0].Message.Content}, nil
 }
 
-func streamOpenAIResponse(cfg *Config, resp *http.Response) (*LLMResponse, error) {
+func streamOpenAIResponse(cfg *Config, resp *http.Response, autoMode bool) (*LLMResponse, error) {
         if resp.StatusCode != http.StatusOK {
                 raw, _ := io.ReadAll(resp.Body)
                 return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, raw)
@@ -1919,7 +1973,9 @@ func streamOpenAIResponse(cfg *Config, resp *http.Response) (*LLMResponse, error
 
         var full strings.Builder
         scanner := bufio.NewScanner(resp.Body)
-        printStreamHeader(cfg)
+        if !autoMode {
+                printStreamHeader(cfg)
+        }
 
         for scanner.Scan() {
                 line := scanner.Text()
@@ -1932,6 +1988,7 @@ func streamOpenAIResponse(cfg *Config, resp *http.Response) (*LLMResponse, error
                 }
                 var chunk openAIResponse
                 if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+                        debugf(cfg, "stream: bad JSON chunk: %v", err)
                         continue
                 }
                 if chunk.Error != nil {
@@ -1940,7 +1997,9 @@ func streamOpenAIResponse(cfg *Config, resp *http.Response) (*LLMResponse, error
                 if len(chunk.Choices) > 0 {
                         tok := chunk.Choices[0].Delta.Content
                         if tok != "" {
-                                fmt.Print(tok)
+                                if !autoMode {
+                                        fmt.Print(tok)
+                                }
                                 full.WriteString(tok)
                         }
                         if chunk.Choices[0].FinishReason != "" {
@@ -1948,7 +2007,9 @@ func streamOpenAIResponse(cfg *Config, resp *http.Response) (*LLMResponse, error
                         }
                 }
         }
-        fmt.Println()
+        if !autoMode {
+                fmt.Println()
+        }
         return &LLMResponse{Text: full.String()}, scanner.Err()
 }
 
@@ -1999,10 +2060,13 @@ func callOllama(ctx context.Context, cfg *Config, history []ChatMessage, autoMod
         // Streaming: newline-delimited JSON
         var full strings.Builder
         scanner := bufio.NewScanner(resp.Body)
-        printStreamHeader(cfg)
+        if !autoMode {
+                printStreamHeader(cfg)
+        }
         for scanner.Scan() {
                 var chunk ollamaResponse
                 if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+                        debugf(cfg, "ollama stream: bad JSON chunk: %v", err)
                         continue
                 }
                 if chunk.Error != "" {
@@ -2010,14 +2074,18 @@ func callOllama(ctx context.Context, cfg *Config, history []ChatMessage, autoMod
                 }
                 tok := chunk.Message.Content
                 if tok != "" {
-                        fmt.Print(tok)
+                        if !autoMode {
+                                fmt.Print(tok)
+                        }
                         full.WriteString(tok)
                 }
                 if chunk.Done {
                         break
                 }
         }
-        fmt.Println()
+        if !autoMode {
+                fmt.Println()
+        }
         return &LLMResponse{Text: full.String()}, scanner.Err()
 }
 
@@ -2133,7 +2201,9 @@ func callAnthropic(ctx context.Context, cfg *Config, history []ChatMessage, auto
         }
         var full strings.Builder
         scanner := bufio.NewScanner(resp.Body)
-        printStreamHeader(cfg)
+        if !autoMode {
+                printStreamHeader(cfg)
+        }
         for scanner.Scan() {
                 line := scanner.Text()
                 if !strings.HasPrefix(line, "data: ") {
@@ -2141,12 +2211,15 @@ func callAnthropic(ctx context.Context, cfg *Config, history []ChatMessage, auto
                 }
                 var event anthropicSSE
                 if err := json.Unmarshal([]byte(line[6:]), &event); err != nil {
+                        debugf(cfg, "anthropic stream: bad JSON chunk: %v", err)
                         continue
                 }
                 switch event.Type {
                 case "content_block_delta":
                         if event.Delta.Text != "" {
-                                fmt.Print(event.Delta.Text)
+                                if !autoMode {
+                                        fmt.Print(event.Delta.Text)
+                                }
                                 full.WriteString(event.Delta.Text)
                         }
                 case "message_stop":
@@ -2158,7 +2231,9 @@ func callAnthropic(ctx context.Context, cfg *Config, history []ChatMessage, auto
                 }
         }
 done:
-        fmt.Println()
+        if !autoMode {
+                fmt.Println()
+        }
         return &LLMResponse{Text: full.String()}, scanner.Err()
 }
 
