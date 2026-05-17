@@ -84,7 +84,7 @@ const (
         defaultOllamaURL   = "http://localhost:11434/api/chat"
         defaultLMStudioURL = "http://localhost:1234/v1/chat/completions"
         anthropicVersion   = "2023-06-01"
-        userAgent          = "openllm-cli/2.0"
+        userAgent          = "openllm-cli/2.0 - https://github.com/blackopsinc/openllm-cli "
 
         // ANSI colors
         colorReset   = "\033[0m"
