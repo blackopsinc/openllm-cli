@@ -7,7 +7,6 @@
 // Flags:
 //   -i, --interactive   start interactive REPL (default when no stdin pipe)
 //   -a, --auto          auto mode: LLM can read/write files and run commands autonomously
-//   -s, --skills        enable skills mode: read SKILL.md/Skills.md and follow directions
 //   -h, --help          show help
 package main
 
@@ -36,6 +35,9 @@ import (
         "golang.org/x/term"
 )
 
+// btwMarker is the prefix users type to inject context during an auto-mode task.
+const btwMarker = "/btw"
+
 // version is set at build time via -ldflags "-X main.version=..."
 var version = "dev"
 
@@ -59,7 +61,6 @@ const (
         envAutoApprove  = "LLM_AUTO_APPROVE" // skip confirmations in auto mode
         envOllamaURL    = "OLLAMA_URL"
         envLMStudioURL  = "LM_STUDIO_URL"
-        envSkillsMode   = "LLM_SKILLS_MODE"
         envInteractive  = "LLM_INTERACTIVE"
 
         // Defaults
@@ -84,7 +85,7 @@ const (
         defaultOllamaURL   = "http://localhost:11434/api/chat"
         defaultLMStudioURL = "http://localhost:1234/v1/chat/completions"
         anthropicVersion   = "2023-06-01"
-        userAgent          = "openllm-cli/2.0 - https://github.com/blackopsinc/openllm-cli "
+        userAgent          = "openllm-cli/2.0"
 
         // ANSI colors
         colorReset   = "\033[0m"
@@ -148,13 +149,6 @@ Match your approach to the task:
 - System tasks: use run_shell with the appropriate system command
 - Only write and compile code when the user explicitly asks for a program`
 
-// skillsSystemPrompt is added when skills mode is enabled
-var skillsSystemPrompt = `
-
-SKILLS MODE ACTIVE: You have access to a skills configuration that defines allowed commands and file access patterns.
-When executing commands or reading files, they will be automatically validated against the skills configuration.
-You can use inline commands with backticks ` + "`command`" + ` and file references with @path/to/file in your responses.`
-
 // ============================================================
 // Provider
 // ============================================================
@@ -186,7 +180,6 @@ type Config struct {
         ShellTimeout time.Duration
         MaxTokens    int
         AutoApprove  bool // skip y/N prompts for tool use
-        SkillsMode   bool // enable skills processing
 }
 
 func loadConfig() *Config {
@@ -239,7 +232,6 @@ func loadConfig() *Config {
                 ShellTimeout: shellTimeout,
                 MaxTokens:    maxTokens,
                 AutoApprove:  isTruthy(envAutoApprove),
-                SkillsMode:   isTruthy(envSkillsMode),
         }
 }
 
@@ -287,175 +279,17 @@ func resolveModel(p Provider) string {
         }
 }
 
-// ============================================================
-// Skills System
-// ============================================================
-
-// SkillsConfig holds parsed skills configuration
-type SkillsConfig struct {
-        Content          string
-        AllowedCommands  []string
-        AllowedPaths     []string
-        DisallowedPaths  []string
-        Instructions     string
-        AutoExecute      bool
-}
-
-// loadSkillsConfig reads and parses SKILL.md or Skills.md
-func loadSkillsConfig(workingDir string) (*SkillsConfig, error) {
-        // Try different possible filenames
-        filenames := []string{"SKILL.md", "Skills.md", "skills.md", "SKILLS.md"}
-
-        var skillsContent string
-        var foundFile string
-
-        for _, filename := range filenames {
-                path := filepath.Join(workingDir, filename)
-                if content, err := os.ReadFile(path); err == nil {
-                        skillsContent = string(content)
-                        foundFile = filename
-                        break
+// loadMDInstructions reads AGENT.md or INSTRUCTIONS.md from dir and returns its content.
+// These files act as project-level instructions injected into the system prompt.
+func loadMDInstructions(dir string) string {
+        for _, name := range []string{"AGENT.md", "INSTRUCTIONS.md"} {
+                data, err := os.ReadFile(filepath.Join(dir, name))
+                if err == nil && len(data) > 0 {
+                        infof("Loaded instructions from %s", name)
+                        return string(data)
                 }
         }
-
-        if skillsContent == "" {
-                return nil, fmt.Errorf("no skills file found (looked for: %s)", strings.Join(filenames, ", "))
-        }
-
-        infof("Loaded skills from %s", foundFile)
-
-        config := &SkillsConfig{
-                Content: skillsContent,
-        }
-
-        // Parse special directives from the skills file
-        config.parseDirectives(skillsContent)
-
-        return config, nil
-}
-
-// parseDirectives extracts configuration from skills markdown
-func (sc *SkillsConfig) parseDirectives(content string) {
-        lines := strings.Split(content, "\n")
-
-        var instructionsLines []string
-        inInstructions := false
-
-        for _, line := range lines {
-                line = strings.TrimSpace(line)
-
-                // Look for configuration blocks
-                if strings.HasPrefix(line, "## Instructions") || strings.HasPrefix(line, "# Instructions") {
-                        inInstructions = true
-                        continue
-                } else if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "# ") {
-                        inInstructions = false
-                }
-
-                if inInstructions && line != "" {
-                        instructionsLines = append(instructionsLines, line)
-                }
-
-                // Parse allowed commands
-                if strings.HasPrefix(line, "ALLOWED_COMMANDS:") {
-                        commands := strings.TrimPrefix(line, "ALLOWED_COMMANDS:")
-                        commands = strings.TrimSpace(commands)
-                        if commands != "" {
-                                sc.AllowedCommands = strings.Split(commands, ",")
-                                for i := range sc.AllowedCommands {
-                                        sc.AllowedCommands[i] = strings.TrimSpace(sc.AllowedCommands[i])
-                                }
-                        }
-                }
-
-                // Parse allowed paths
-                if strings.HasPrefix(line, "ALLOWED_PATHS:") {
-                        paths := strings.TrimPrefix(line, "ALLOWED_PATHS:")
-                        paths = strings.TrimSpace(paths)
-                        if paths != "" {
-                                sc.AllowedPaths = strings.Split(paths, ",")
-                                for i := range sc.AllowedPaths {
-                                        sc.AllowedPaths[i] = strings.TrimSpace(sc.AllowedPaths[i])
-                                }
-                        }
-                }
-
-                // Parse disallowed paths
-                if strings.HasPrefix(line, "DISALLOWED_PATHS:") {
-                        paths := strings.TrimPrefix(line, "DISALLOWED_PATHS:")
-                        paths = strings.TrimSpace(paths)
-                        if paths != "" {
-                                sc.DisallowedPaths = strings.Split(paths, ",")
-                                for i := range sc.DisallowedPaths {
-                                        sc.DisallowedPaths[i] = strings.TrimSpace(sc.DisallowedPaths[i])
-                                }
-                        }
-                }
-
-                // Parse auto-execute flag
-                if strings.Contains(line, "AUTO_EXECUTE:") && strings.Contains(line, "true") {
-                        sc.AutoExecute = true
-                }
-        }
-
-        if len(instructionsLines) > 0 {
-                sc.Instructions = strings.Join(instructionsLines, "\n")
-        }
-}
-
-// isCommandAllowed checks if a command is allowed based on skills configuration
-func (sc *SkillsConfig) isCommandAllowed(cmd string) bool {
-        if len(sc.AllowedCommands) == 0 {
-                // Default safe commands if none specified
-                defaultAllowed := []string{"curl", "id", "whoami", "date", "pwd", "ls", "cat", "head", "tail", "grep", "echo", "which", "uname"}
-                for _, allowed := range defaultAllowed {
-                        if strings.HasPrefix(cmd, allowed+" ") || cmd == allowed {
-                                return true
-                        }
-                }
-                return false
-        }
-
-        for _, allowed := range sc.AllowedCommands {
-                if strings.HasPrefix(cmd, allowed+" ") || cmd == allowed {
-                        return true
-                }
-        }
-        return false
-}
-
-// isPathAllowed checks if a path is allowed for reading
-func (sc *SkillsConfig) isPathAllowed(path string) bool {
-        absPath, err := filepath.Abs(path)
-        if err != nil {
-                return false
-        }
-
-        // Check disallowed paths first
-        for _, disallowed := range sc.DisallowedPaths {
-                if matched, _ := filepath.Match(disallowed, absPath); matched {
-                        return false
-                }
-                if strings.HasPrefix(absPath, disallowed) {
-                        return false
-                }
-        }
-
-        // If no allowed paths specified, allow current directory and subdirectories
-        if len(sc.AllowedPaths) == 0 {
-                cwd, _ := os.Getwd()
-                return strings.HasPrefix(absPath, cwd)
-        }
-
-        // Check allowed paths
-        for _, allowed := range sc.AllowedPaths {
-                allowedAbs, _ := filepath.Abs(allowed)
-                if strings.HasPrefix(absPath, allowedAbs) {
-                        return true
-                }
-        }
-
-        return false
+        return ""
 }
 
 // ============================================================
@@ -604,31 +438,19 @@ func extractTag(s, tag string) string {
 // ============================================================
 
 type Session struct {
-        cfg          *Config
-        history      []ChatMessage
-        cwd          string // tracked working directory
-        autoMode     bool
-        skillsMode   bool
-        skillsConfig *SkillsConfig
-        cancelMu     sync.Mutex
-        cancelReq    context.CancelFunc // non-nil while an LLM request is in flight
+        cfg            *Config
+        history        []ChatMessage
+        cwd            string // tracked working directory
+        autoMode       bool
+        mdInstructions string // content of AGENT.md or INSTRUCTIONS.md, if present
+        cancelMu       sync.Mutex
+        cancelReq      context.CancelFunc // non-nil while an LLM request is in flight
 }
 
-func newSession(cfg *Config, auto bool, skills bool) *Session {
+func newSession(cfg *Config, auto bool) *Session {
         cwd, _ := os.Getwd()
-        s := &Session{cfg: cfg, cwd: cwd, autoMode: auto, skillsMode: skills}
-
-        // Load skills configuration if skills mode is enabled
-        if skills {
-                if skillsConfig, err := loadSkillsConfig(cwd); err != nil {
-                        infof("Skills mode disabled: %v", err)
-                        s.skillsMode = false
-                } else {
-                        s.skillsConfig = skillsConfig
-                        infof("Skills mode enabled with %d allowed commands", len(skillsConfig.AllowedCommands))
-                }
-        }
-
+        s := &Session{cfg: cfg, cwd: cwd, autoMode: auto}
+        s.mdInstructions = loadMDInstructions(cwd)
         return s
 }
 
@@ -649,7 +471,7 @@ func (s *Session) send() (*LLMResponse, error) {
                 s.cancelReq = nil
                 s.cancelMu.Unlock()
         }()
-        return callLLM(ctx, s.cfg, s.history, s.autoMode, s.skillsMode, s.skillsConfig)
+        return callLLM(ctx, s.cfg, s.history, s.autoMode, s.mdInstructions)
 }
 
 // ============================================================
@@ -664,14 +486,6 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
                 path := tc.Input["path"]
                 if path == "" {
                         return "", fmt.Errorf("read_file: missing <path>")
-                }
-
-                // Skills mode validation
-                if s.skillsMode && s.skillsConfig != nil {
-                        absPath := filepath.Join(s.cwd, path)
-                        if !s.skillsConfig.isPathAllowed(absPath) {
-                                return fmt.Sprintf("[read_file error: path %s not allowed by skills configuration]", path), nil
-                        }
                 }
 
                 content, err := readPath(filepath.Join(s.cwd, path))
@@ -690,14 +504,6 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
                         return fmt.Sprintf("[write_file error: missing <content> tag or empty content for %s. Include the full file content between <content>...</content> tags]", path), nil
                 }
 
-                // Skills mode validation
-                if s.skillsMode && s.skillsConfig != nil {
-                        absPath := filepath.Join(s.cwd, path)
-                        if !s.skillsConfig.isPathAllowed(absPath) {
-                                return fmt.Sprintf("[write_file error: path %s not allowed by skills configuration]", path), nil
-                        }
-                }
-
                 abs := filepath.Join(s.cwd, path)
                 if err := writeFileAtomic(abs, content); err != nil {
                         return fmt.Sprintf("[write_file error: %v]", err), nil
@@ -708,13 +514,6 @@ func (s *Session) executeTool(tc *ToolCall) (string, error) {
                 cmd := tc.Input["command"]
                 if cmd == "" {
                         return "[run_shell error: missing <command> tag. Correct format: <run_shell><command>your command here</command></run_shell>]", nil
-                }
-
-                // Skills mode validation
-                if s.skillsMode && s.skillsConfig != nil {
-                        if !s.skillsConfig.isCommandAllowed(cmd) {
-                                return fmt.Sprintf("[run_shell error: command '%s' not allowed by skills configuration]", cmd), nil
-                        }
                 }
 
                 var out string
@@ -751,23 +550,6 @@ func (s *Session) confirm(tc *ToolCall) bool {
                 return true
         }
 
-        // In skills mode with auto_execute, auto-approve safe commands
-        if s.skillsMode && s.skillsConfig != nil && s.skillsConfig.AutoExecute {
-                if tc.Name == toolRunShell {
-                        cmd := tc.Input["command"]
-                        if s.skillsConfig.isCommandAllowed(cmd) {
-                                return true
-                        }
-                }
-                if tc.Name == toolReadFile {
-                        path := tc.Input["path"]
-                        absPath := filepath.Join(s.cwd, path)
-                        if s.skillsConfig.isPathAllowed(absPath) {
-                                return true
-                        }
-                }
-        }
-
         var desc string
         switch tc.Name {
         case toolReadFile:
@@ -799,7 +581,23 @@ func (s *Session) runAutoTask() error {
         lastResult := ""
         consecutiveErrors := 0
 
+        // Start the background /btw interrupt reader.
+        // done is closed (and a goroutine yield is issued) when we return so
+        // the reader goroutine has a chance to exit before the next readLine.
+        done := make(chan struct{})
+        defer func() {
+                close(done)
+                runtime.Gosched() // let the goroutine see done before lr.readLine retakes stdin
+        }()
+        interruptCh := s.startAutoInterruptReader(done)
+
+        fmt.Printf("%s  ↳ Type %s <message> + Enter to send context to the AI mid-task%s\n",
+                colorDim, btwMarker, colorReset)
+
         for round := 0; round < maxRounds; round++ {
+                // Inject any /btw messages the user typed since the last round.
+                s.drainInterrupts(interruptCh)
+
                 resp, err := s.send()
                 if err != nil {
                         return fmt.Errorf("LLM error: %w", err)
@@ -815,21 +613,15 @@ func (s *Session) runAutoTask() error {
                         return nil
                 }
 
-                // Process skills inline commands and file references before printing
-                processedText := resp.Text
-                if s.skillsMode {
-                        processedText = s.processSkillsInline(resp.Text)
-                }
-
                 // Strip the tool call XML from display text to avoid raw XML in output
-                displayText := processedText
+                displayText := resp.Text
                 if tc != nil {
-                        displayText = stripToolCallXML(processedText)
+                        displayText = stripToolCallXML(resp.Text)
                 }
                 if strings.TrimSpace(displayText) != "" {
                         printAssistant(s.cfg, displayText)
                 }
-                s.addAssistant(processedText)
+                s.addAssistant(resp.Text)
 
                 if tc == nil {
                         debugf(s.cfg, "no tool call detected in response (round %d)", round+1)
@@ -870,69 +662,88 @@ func (s *Session) runAutoTask() error {
         return fmt.Errorf("reached maximum tool rounds (%d) without completing", maxRounds)
 }
 
-// processSkillsInline processes inline commands and file references in skills mode
-func (s *Session) processSkillsInline(text string) string {
-        if s.skillsConfig == nil {
-                return text
+// ============================================================
+// Auto mode interrupt reader  (/btw)
+// ============================================================
+
+// startAutoInterruptReader launches a background goroutine that reads stdin
+// during an auto-mode task. Any line beginning with "/btw" is forwarded to
+// the returned channel so runAutoTask can inject it as user context.
+//
+// The goroutine reads one byte at a time and checks done after every byte.
+// This means it exits on the very next character received after done closes,
+// at most dropping one byte — rather than holding a large buffered read that
+// competes with the next readLine call in raw mode.
+func (s *Session) startAutoInterruptReader(done <-chan struct{}) <-chan string {
+        ch := make(chan string, 16)
+        go func() {
+                defer close(ch)
+                var line strings.Builder
+                b := make([]byte, 1)
+                for {
+                        select {
+                        case <-done:
+                                return
+                        default:
+                        }
+
+                        n, err := os.Stdin.Read(b)
+                        if err != nil || n == 0 {
+                                return
+                        }
+
+                        select {
+                        case <-done:
+                                return
+                        default:
+                        }
+
+                        if b[0] == '\n' || b[0] == '\r' {
+                                lineStr := strings.TrimSpace(line.String())
+                                line.Reset()
+                                if lineStr == "" {
+                                        continue
+                                }
+                                if !strings.HasPrefix(lineStr, btwMarker) {
+                                        fmt.Printf("\n%s[auto mode] Use %s <message> to send context to the AI%s\n",
+                                                colorDim, btwMarker, colorReset)
+                                        continue
+                                }
+                                msg := strings.TrimSpace(lineStr[len(btwMarker):])
+                                if msg == "" {
+                                        msg = "(user interrupted with /btw — no message)"
+                                }
+                                fmt.Printf("\n%s↩ [/btw queued — will be injected after the current step]%s\n",
+                                        colorCyan, colorReset)
+                                select {
+                                case ch <- msg:
+                                case <-done:
+                                        return
+                                }
+                        } else {
+                                line.WriteByte(b[0])
+                        }
+                }
+        }()
+        return ch
+}
+
+// drainInterrupts pulls every pending /btw message off the channel and
+// appends them to the conversation as user turns, then prints a notice.
+func (s *Session) drainInterrupts(ch <-chan string) {
+        for {
+                select {
+                case msg, ok := <-ch:
+                        if !ok {
+                                return
+                        }
+                        notice := "[User added context mid-task via /btw: " + msg + "]"
+                        fmt.Printf("%s%s%s\n", colorCyan+colorBold, notice, colorReset)
+                        s.addUser(notice)
+                default:
+                        return
+                }
         }
-
-        // Process backtick commands
-        text = s.processInlineCommands(text)
-
-        // Process @file references
-        text = s.processInlineFileRefs(text)
-
-        return text
-}
-
-// processInlineCommands executes commands in backticks if allowed
-func (s *Session) processInlineCommands(text string) string {
-        // Regex to find `command` patterns
-        re := regexp.MustCompile("`([^`]+)`")
-
-        return re.ReplaceAllStringFunc(text, func(match string) string {
-                cmd := match[1 : len(match)-1] // Remove backticks
-
-                if !s.skillsConfig.isCommandAllowed(cmd) {
-                        return fmt.Sprintf("[command '%s' not allowed]", cmd)
-                }
-
-                out, err := runShell(cmd, s.cwd, s.cfg.ShellTimeout)
-                if err != nil {
-                        out += " [error: " + err.Error() + "]"
-                }
-
-                fmt.Printf("%s[executed: `%s`]%s\n", colorDim, cmd, colorReset)
-
-                if out == "" {
-                        return "(no output)"
-                }
-                return out
-        })
-}
-
-// processInlineFileRefs reads files referenced with @path if allowed
-func (s *Session) processInlineFileRefs(text string) string {
-        // Regex to find @path patterns
-        re := regexp.MustCompile(`@([^\s]+)`)
-
-        return re.ReplaceAllStringFunc(text, func(match string) string {
-                path := match[1:] // Remove @
-                absPath := filepath.Join(s.cwd, path)
-
-                if !s.skillsConfig.isPathAllowed(absPath) {
-                        return fmt.Sprintf("[file '%s' not allowed]", path)
-                }
-
-                content, err := readPath(absPath)
-                if err != nil {
-                        return fmt.Sprintf("[file error: %v]", err)
-                }
-
-                fmt.Printf("%s[read: @%s]%s\n", colorDim, path, colorReset)
-
-                return fmt.Sprintf("[File: %s]\n```\n%s\n```", path, content)
-        })
 }
 
 // ============================================================
@@ -1206,19 +1017,15 @@ func (lr *lineReader) readLine(prompt string) (string, error) {
 
 func promptStr(s *Session) string {
         mode := ""
-        if s.autoMode && s.skillsMode {
-                mode = colorMagenta + " [auto+skills]" + colorReset
-        } else if s.autoMode {
+        if s.autoMode {
                 mode = colorMagenta + " [auto]" + colorReset
-        } else if s.skillsMode {
-                mode = colorMagenta + " [skills]" + colorReset
         }
         return fmt.Sprintf("%s%sopenllm-cli%s%s %s›%s ", colorBold, colorCyan, colorReset, mode, colorDim, colorReset)
 }
 
-func runInteractive(cfg *Config, autoMode, skillsMode bool) {
-        s := newSession(cfg, autoMode, skillsMode)
-        printBanner(cfg, autoMode, skillsMode)
+func runInteractive(cfg *Config, autoMode bool) {
+        s := newSession(cfg, autoMode)
+        printBanner(cfg, autoMode)
 
         histFile := ""
         if home, err := os.UserHomeDir(); err == nil {
@@ -1288,13 +1095,8 @@ func runInteractive(cfg *Config, autoMode, skillsMode bool) {
                                 s.history = s.history[:len(s.history)-1]
                                 continue
                         }
-
-                        responseText := resp.Text
-                        if s.skillsMode {
-                                responseText = s.processSkillsInline(resp.Text)
-                        }
-                        s.printChatResponse(responseText)
-                        s.addAssistant(responseText)
+                        s.printChatResponse(resp.Text)
+                        s.addAssistant(resp.Text)
                 }
                 fmt.Println()
         }
@@ -1354,21 +1156,6 @@ func (s *Session) handleSlashCommand(line string) (quit bool) {
         case "/auto":
                 s.autoMode = !s.autoMode
                 infof("Auto mode: %v", s.autoMode)
-
-        case "/skills":
-                s.skillsMode = !s.skillsMode
-                if s.skillsMode && s.skillsConfig == nil {
-                        // Try to load skills config
-                        if skillsConfig, err := loadSkillsConfig(s.cwd); err != nil {
-                                infof("Cannot enable skills mode: %v", err)
-                                s.skillsMode = false
-                        } else {
-                                s.skillsConfig = skillsConfig
-                                infof("Skills mode enabled")
-                        }
-                } else {
-                        infof("Skills mode: %v", s.skillsMode)
-                }
 
         case "/approve":
                 s.cfg.AutoApprove = !s.cfg.AutoApprove
@@ -1438,6 +1225,13 @@ func (s *Session) handleSlashCommand(line string) (quit bool) {
         case "/help":
                 printCommandHelp()
 
+        case "/btw":
+                // /btw is consumed by the auto-mode interrupt reader while a task is
+                // running.  If we reach this handler the user typed it at the normal
+                // prompt with no active task.
+                infof("/btw is for injecting context during an active auto-mode task.")
+                infof("No auto task is currently running — just send your message normally.")
+
         default:
                 printError(fmt.Sprintf("Unknown command: %s  (type /help)", cmd))
         }
@@ -1448,15 +1242,6 @@ func (s *Session) handleSlashCommand(line string) (quit bool) {
 // cmdRead reads a file/dir and optionally sends it to the LLM.
 func (s *Session) cmdRead(path string) {
         abs := filepath.Join(s.cwd, path)
-
-        // Skills mode validation
-        if s.skillsMode && s.skillsConfig != nil {
-                if !s.skillsConfig.isPathAllowed(abs) {
-                        printError(fmt.Sprintf("Path %s not allowed by skills configuration", path))
-                        return
-                }
-        }
-
         content, err := readPath(abs)
         if err != nil {
                 printError(err.Error())
@@ -1478,15 +1263,6 @@ func (s *Session) cmdRead(path string) {
 // cmdWrite writes content to a file. Uses last assistant reply if no content typed.
 func (s *Session) cmdWrite(path string) {
         abs := filepath.Join(s.cwd, path)
-
-        // Skills mode validation
-        if s.skillsMode && s.skillsConfig != nil {
-                if !s.skillsConfig.isPathAllowed(abs) {
-                        printError(fmt.Sprintf("Path %s not allowed by skills configuration", path))
-                        return
-                }
-        }
-
         // Default to last assistant message
         content := s.lastAssistantReply()
         if content == "" {
@@ -1517,14 +1293,6 @@ func (s *Session) cmdWrite(path string) {
 
 // cmdRun executes a shell command and optionally sends output to the LLM.
 func (s *Session) cmdRun(cmd string) {
-        // Skills mode validation
-        if s.skillsMode && s.skillsConfig != nil {
-                if !s.skillsConfig.isCommandAllowed(cmd) {
-                        printError(fmt.Sprintf("Command '%s' not allowed by skills configuration", cmd))
-                        return
-                }
-        }
-
         if !s.cfg.AutoApprove {
                 fmt.Printf("%s%s⚠  Run: %s%s\n", colorBold, colorYellow, colorReset, cmd)
                 if !askYN("Confirm?") {
@@ -1565,13 +1333,8 @@ func (s *Session) dispatchLLM() {
                         s.history = s.history[:len(s.history)-1]
                         return
                 }
-
-                responseText := resp.Text
-                if s.skillsMode {
-                        responseText = s.processSkillsInline(resp.Text)
-                }
-                s.printChatResponse(responseText)
-                s.addAssistant(responseText)
+                s.printChatResponse(resp.Text)
+                s.addAssistant(resp.Text)
         }
         fmt.Println()
 }
@@ -1798,6 +1561,14 @@ func runShellLive(cmd, cwd string, timeout time.Duration) (string, error) {
                 c.Dir = cwd
         }
 
+        // Save terminal state before running the command. Child processes that
+        // use ncurses, raw mode, or interactive input can leave the TTY with
+        // ISIG disabled, no echo, or other broken attributes if they exit
+        // uncleanly. Restoring it ensures Ctrl+C keeps generating SIGINT and
+        // the prompt behaves normally after the command.
+        fd := int(os.Stdin.Fd())
+        savedState, savedErr := term.GetState(fd)
+
         var buf bytes.Buffer
         c.Stdout = io.MultiWriter(os.Stdout, &buf)
         c.Stderr = io.MultiWriter(os.Stderr, &buf)
@@ -1805,6 +1576,10 @@ func runShellLive(cmd, cwd string, timeout time.Duration) (string, error) {
         fmt.Printf("%s", colorDim)
         err := c.Run()
         fmt.Printf("%s", colorReset)
+
+        if savedErr == nil {
+                _ = term.Restore(fd, savedState)
+        }
 
         if ctx.Err() == context.DeadlineExceeded {
                 return buf.String(), fmt.Errorf("timed out after %v", timeout)
@@ -1816,17 +1591,17 @@ func runShellLive(cmd, cwd string, timeout time.Duration) (string, error) {
 // LLM client — unified interface across all providers
 // ============================================================
 
-func callLLM(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+func callLLM(ctx context.Context, cfg *Config, history []ChatMessage, autoMode bool, mdInstructions string) (*LLMResponse, error) {
         switch cfg.Provider {
         case ProviderAnthropic:
-                return callAnthropic(ctx, cfg, history, autoMode, skillsMode, skillsConfig)
+                return callAnthropic(ctx, cfg, history, autoMode, mdInstructions)
         default:
-                return callOpenAICompat(ctx, cfg, history, autoMode, skillsMode, skillsConfig)
+                return callOpenAICompat(ctx, cfg, history, autoMode, mdInstructions)
         }
 }
 
-// buildSystemPrompt returns the effective system prompt, merging auto-mode and skills instructions.
-func buildSystemPrompt(cfg *Config, autoMode, skillsMode bool, skillsConfig *SkillsConfig) string {
+// buildSystemPrompt returns the effective system prompt, merging auto-mode and .md instructions.
+func buildSystemPrompt(cfg *Config, autoMode bool, mdInstructions string) string {
         base := cfg.SystemPrompt
 
         if autoMode {
@@ -1837,19 +1612,16 @@ func buildSystemPrompt(cfg *Config, autoMode, skillsMode bool, skillsConfig *Ski
                 }
         }
 
-        if skillsMode && skillsConfig != nil {
-                base = base + skillsSystemPrompt
-                if skillsConfig.Instructions != "" {
-                        base = base + "\n\nSKILLS INSTRUCTIONS:\n" + skillsConfig.Instructions
-                }
+        if mdInstructions != "" {
+                base = base + "\n\n## Project Instructions\n\n" + mdInstructions
         }
 
         return base
 }
 
 // buildOpenAIMessages converts history + system prompt into an OpenAI messages array.
-func buildOpenAIMessages(cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) []ChatMessage {
-        sys := buildSystemPrompt(cfg, autoMode, skillsMode, skillsConfig)
+func buildOpenAIMessages(cfg *Config, history []ChatMessage, autoMode bool, mdInstructions string) []ChatMessage {
+        sys := buildSystemPrompt(cfg, autoMode, mdInstructions)
         if sys == "" {
                 return history
         }
@@ -1888,16 +1660,12 @@ type ollamaResponse struct {
         Error string `json:"error,omitempty"`
 }
 
-func callOpenAICompat(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+func callOpenAICompat(ctx context.Context, cfg *Config, history []ChatMessage, autoMode bool, mdInstructions string) (*LLMResponse, error) {
         if cfg.Provider == ProviderOllama {
-                return callOllama(ctx, cfg, history, autoMode, skillsMode, skillsConfig)
+                return callOllama(ctx, cfg, history, autoMode, mdInstructions)
         }
 
-        msgs := buildOpenAIMessages(cfg, history, autoMode, skillsMode, skillsConfig)
-        if len(history) > 0 && history[0].Role == "system" {
-                msgs = history
-        }
-
+        msgs := buildOpenAIMessages(cfg, history, autoMode, mdInstructions)
         apiURL := cfg.apiURL()
         body := openAIRequest{Model: cfg.Model, Messages: msgs, Stream: cfg.Stream}
 
@@ -2015,18 +1783,17 @@ func streamOpenAIResponse(cfg *Config, resp *http.Response, autoMode bool) (*LLM
 
 // ---- Ollama (uses same format but different streaming protocol) ----
 
-func callOllama(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
-        msgs := buildOpenAIMessages(cfg, history, autoMode, skillsMode, skillsConfig)
-        if len(history) > 0 && history[0].Role == "system" {
-                msgs = history
-        }
-
+func callOllama(ctx context.Context, cfg *Config, history []ChatMessage, autoMode bool, mdInstructions string) (*LLMResponse, error) {
+        msgs := buildOpenAIMessages(cfg, history, autoMode, mdInstructions)
         body := map[string]interface{}{
                 "model":    cfg.Model,
                 "messages": msgs,
                 "stream":   cfg.Stream,
         }
-        data, _ := json.Marshal(body)
+        data, err := json.Marshal(body)
+        if err != nil {
+                return nil, err
+        }
 
         debugf(cfg, "POST %s  model=%s", cfg.OllamaURL, cfg.Model)
 
@@ -2123,9 +1890,9 @@ type anthropicSSE struct {
         } `json:"error,omitempty"`
 }
 
-func callAnthropic(ctx context.Context, cfg *Config, history []ChatMessage, autoMode, skillsMode bool, skillsConfig *SkillsConfig) (*LLMResponse, error) {
+func callAnthropic(ctx context.Context, cfg *Config, history []ChatMessage, autoMode bool, mdInstructions string) (*LLMResponse, error) {
         // Anthropic puts system at the top level, not as a message
-        sys := buildSystemPrompt(cfg, autoMode, skillsMode, skillsConfig)
+        sys := buildSystemPrompt(cfg, autoMode, mdInstructions)
         msgs := make([]ChatMessage, 0, len(history))
         for _, m := range history {
                 if m.Role == "system" {
@@ -2269,7 +2036,7 @@ func runPipe(cfg *Config) {
                 fatalf("expand: %v", err)
         }
 
-        s := newSession(cfg, false, cfg.SkillsMode)
+        s := newSession(cfg, false)
         s.addUser(expanded)
 
         resp, err := s.send()
@@ -2277,13 +2044,8 @@ func runPipe(cfg *Config) {
                 fatalf("LLM: %v", err)
         }
 
-        responseText := resp.Text
-        if cfg.SkillsMode {
-                responseText = s.processSkillsInline(resp.Text)
-        }
-
         if !cfg.Stream {
-                fmt.Println(responseText)
+                fmt.Println(resp.Text)
         }
 }
 
@@ -2296,7 +2058,6 @@ func main() {
 
         interactive := isTruthy(envInteractive) // can also be forced via env
         autoMode := false
-        skillsMode := cfg.SkillsMode
 
         // Simple flag parsing — no external deps
         args := os.Args[1:]
@@ -2307,9 +2068,6 @@ func main() {
                 case "-a", "--auto":
                         interactive = true
                         autoMode = true
-                case "-s", "--skills":
-                        interactive = true
-                        skillsMode = true
                 case "-h", "--help":
                         printHelp()
                         os.Exit(0)
@@ -2322,7 +2080,7 @@ func main() {
         }
 
         if interactive {
-                runInteractive(cfg, autoMode, skillsMode)
+                runInteractive(cfg, autoMode)
         } else {
                 runPipe(cfg)
         }
@@ -2341,17 +2099,10 @@ func isTerminal() bool {
 // UI helpers
 // ============================================================
 
-func printBanner(cfg *Config, autoMode, skillsMode bool) {
+func printBanner(cfg *Config, autoMode bool) {
         mode := "chat"
         if autoMode {
                 mode = "auto"
-        }
-        if skillsMode {
-                if autoMode {
-                        mode = "auto+skills"
-                } else {
-                        mode = "skills"
-                }
         }
         wd, _ := os.Getwd()
         fmt.Printf("\n%s%s openllm-cli %s%s  %s%s · %s · %s%s\n",
@@ -2359,14 +2110,7 @@ func printBanner(cfg *Config, autoMode, skillsMode bool) {
                 colorDim, cfg.Provider, cfg.Model, mode, colorReset,
         )
         fmt.Printf("%scwd: %s%s\n", colorDim, wd, colorReset)
-
-        helpText := "/help for commands · /auto to toggle auto mode"
-        if skillsMode {
-                helpText += " · /skills to toggle skills mode"
-        }
-        helpText += " · /exit to quit"
-
-        fmt.Printf("%s%s%s\n\n", colorDim, helpText, colorReset)
+        fmt.Printf("%s/help for commands · /auto to toggle auto mode · /exit to quit%s\n\n", colorDim, colorReset)
 }
 
 func printAssistant(cfg *Config, text string) {
@@ -2436,13 +2180,13 @@ func printCommandHelp() {
                         {"/exit  /quit  /q", "quit"},
                         {"/clear  /reset", "clear conversation history"},
                         {"/history", "show message history"},
+                        {"/btw <message>", "inject context into the AI mid-task (auto mode only)"},
                 }},
                 {"Config", []row{
                         {"/model [name]", "get/set model"},
                         {"/system [text]", "get/set system prompt"},
                         {"/stream", "toggle streaming"},
                         {"/auto", "toggle auto mode (tool use)"},
-                        {"/skills", "toggle skills mode (SKILL.md integration)"},
                         {"/approve", "toggle auto-approve for tool actions"},
                         {"/maxtokens [n]", "get/set max_tokens (Anthropic)"},
                 }},
@@ -2473,22 +2217,22 @@ func printCommandHelp() {
         fmt.Printf("  %s`cmd`%s           run command and inject output into prompt\n", colorMagenta, colorReset)
         fmt.Println()
 
-        fmt.Printf("%sSkills mode%s — controlled command execution and file access:\n", colorBold, colorReset)
-        fmt.Printf("  Start with %s-s%s / %s--skills%s, or type %s/skills%s to toggle.\n", colorYellow, colorReset, colorYellow, colorReset, colorYellow, colorReset)
-        fmt.Printf("  Reads SKILL.md/Skills.md for allowed commands and paths.\n")
-        fmt.Printf("  AI can use inline `commands` and @file references safely.\n\n")
+        fmt.Printf("%sProject instructions%s — drop an AGENT.md or INSTRUCTIONS.md in your working\n", colorBold, colorReset)
+        fmt.Printf("  directory and its contents will be injected into the system prompt automatically.\n\n")
 
         fmt.Printf("%sAuto mode%s — the LLM can use tools autonomously:\n", colorBold, colorReset)
         fmt.Printf("  Start with %s-a%s / %s--auto%s, or type %s/auto%s to toggle.\n", colorYellow, colorReset, colorYellow, colorReset, colorYellow, colorReset)
         fmt.Printf("  Tools: read_file · write_file · run_shell\n")
         fmt.Printf("  All tool actions run without confirmation in auto mode.\n")
-        fmt.Printf("  Set %sLLM_AUTO_APPROVE=1%s to skip confirmations in non-auto modes.\n\n", colorYellow, colorReset)
+        fmt.Printf("  Set %sLLM_AUTO_APPROVE=1%s to skip confirmations in non-auto modes.\n", colorYellow, colorReset)
+        fmt.Printf("  While a task is running type %s/btw <message>%s + Enter to inject\n", colorYellow, colorReset)
+        fmt.Printf("  context into the conversation mid-task (e.g. course-corrections).\n\n")
 
         fmt.Printf("%sExamples%s\n", colorBold, colorReset)
         fmt.Printf("  openllm-cli > review @./main.go and list any bugs\n")
         fmt.Printf("  openllm-cli > `ps aux` what are all these processes?\n")
         fmt.Printf("  openllm-cli -a > read package.json and update the version to 2.0.0\n")
-        fmt.Printf("  openllm-cli -s > what system info can you gather?\n\n")
+        fmt.Printf("  openllm-cli -a > `git diff` summarise these changes\n\n")
 }
 
 func printHelp() {
@@ -2500,13 +2244,11 @@ Interactive LLM CLI with filesystem access, auto mode, and skills integration.
   openllm-cli                  interactive REPL (auto-detected)
   openllm-cli -i               force interactive mode
   openllm-cli -a               interactive mode with auto tool use
-  openllm-cli -s               interactive mode with skills integration
   echo "prompt" | openllm-cli  single-shot pipe mode
 
 %sFlags:%s
   -i, --interactive   interactive REPL
   -a, --auto          auto mode (LLM can read/write files and run commands)
-  -s, --skills        skills mode (read SKILL.md and allow inline commands/files)
   -h, --help          show this help
 
 %sEnvironment:%s
@@ -2518,7 +2260,6 @@ Interactive LLM CLI with filesystem access, auto mode, and skills integration.
   LLM_TIMEOUT          LLM request timeout seconds (default 120 / 300 streaming)
   LLM_SHELL_TIMEOUT    shell command timeout seconds (default 60)
   LLM_AUTO_APPROVE     1/true to skip tool-use confirmations
-  LLM_SKILLS_MODE      1/true to enable skills mode by default
   LLM_VERBOSE          1/true for debug logging
 
   OPENROUTER_API_KEY   required for openrouter
@@ -2534,14 +2275,10 @@ Interactive LLM CLI with filesystem access, auto mode, and skills integration.
   ollama       %s
   lmstudio     %s
 
-%sSkills configuration (SKILL.md/Skills.md):%s
-  ALLOWED_COMMANDS: curl,id,whoami,date
-  ALLOWED_PATHS: .,./config,/tmp
-  DISALLOWED_PATHS: ~/.ssh,/etc
-  AUTO_EXECUTE: true
-
-  ## Instructions
-  You are a system assistant that can gather information safely.
+%sProject instructions (AGENT.md / INSTRUCTIONS.md):%s
+  Drop either file in your working directory and its contents will be
+  injected into the system prompt automatically on every session start.
+  Useful for project-specific context, personas, or standing instructions.
 `,
                 colorBold, colorCyan, colorReset,
                 colorBold, colorReset,

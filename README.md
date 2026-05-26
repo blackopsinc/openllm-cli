@@ -1,12 +1,12 @@
 # openllm-cli
 
-An interactive LLM CLI with filesystem access, autonomous tool use, and skills integration. Defaults to Ollama (local, no API key). Also supports Anthropic, OpenAI, OpenRouter, and LM Studio.
+An interactive LLM CLI with filesystem access and autonomous tool use. Defaults to Ollama (local, no API key). Also supports Anthropic, OpenAI, OpenRouter, and LM Studio.
 
 ## Features
 
 - **Interactive REPL** — multi-turn conversation with history, slash commands, and inline file/command injection
 - **Auto mode** — fully autonomous: the LLM reads/writes files and runs shell commands to complete any task
-- **Skills mode** — controlled execution driven by a `SKILL.md` file in your working directory
+- **Project instructions** — drop `AGENT.md` or `INSTRUCTIONS.md` in your working directory; its contents are injected into the system prompt automatically
 - **Pipe mode** — single-shot stdin → stdout for scripting and shell pipelines
 - **Streaming** — real-time token output in chat mode; tool actions streamed live in auto mode
 - **Multi-provider** — one binary, five backends
@@ -69,7 +69,6 @@ git diff | openllm-cli
 |------|-------------|
 | `-i`, `--interactive` | Force interactive REPL |
 | `-a`, `--auto` | Auto mode: fully autonomous tool use, no confirmations |
-| `-s`, `--skills` | Skills mode: read `SKILL.md` for allowed commands/paths |
 | `-h`, `--help` | Show help |
 
 ## Environment Variables
@@ -84,7 +83,6 @@ git diff | openllm-cli
 | `LLM_TIMEOUT` | `120` / `300` streaming | LLM request timeout (seconds) |
 | `LLM_SHELL_TIMEOUT` | `60` | Shell command timeout (seconds) |
 | `LLM_AUTO_APPROVE` | `false` | Skip tool confirmations in non-auto modes |
-| `LLM_SKILLS_MODE` | `false` | Enable skills mode by default |
 | `LLM_VERBOSE` | `false` | Debug logging (shows requests, model responses, parsing details) |
 | `LLM_INTERACTIVE` | `false` | Force interactive REPL even when stdin is piped |
 | `OPENROUTER_API_KEY` | — | Required for `openrouter` |
@@ -156,6 +154,7 @@ openllm-cli
 | `/exit` · `/quit` · `/q` | Quit |
 | `/clear` · `/reset` | Clear conversation history |
 | `/history` | Show message history |
+| `/btw <message>` | Inject context into the AI mid-task (auto mode only) |
 
 ### Config
 
@@ -165,7 +164,6 @@ openllm-cli
 | `/system [text]` | Get or set system prompt |
 | `/stream` | Toggle streaming |
 | `/auto` | Toggle auto mode (fully autonomous) |
-| `/skills` | Toggle skills mode |
 | `/approve` | Toggle auto-approve for tool actions |
 | `/maxtokens [n]` | Get or set max_tokens |
 
@@ -231,7 +229,7 @@ The agent picks the right approach for the task:
 
 ### Loop protection
 
-If the model gets stuck repeating the same error (e.g. a malformed tool call), the loop breaks after 3 identical results and reports what went wrong. This prevents runaway inference on low-capability models.
+If the model gets stuck repeating the same tool result 3 times in a row (e.g. a malformed tool call it can't recover from), the loop breaks and reports what went wrong. This prevents runaway inference on low-capability models.
 
 ## Non-Auto Mode
 
@@ -243,21 +241,18 @@ In regular chat mode, if the model outputs a tool call (some models do this rega
 
 Any prose the model wrote before the tool call is shown normally.
 
-## Skills Mode
+## Project Instructions
 
-Create a `SKILL.md` in your working directory to control what the agent can do:
+Drop an `AGENT.md` or `INSTRUCTIONS.md` file in your working directory. On session start the CLI reads whichever it finds first and appends its contents to the system prompt — before the first message is sent.
 
 ```markdown
-ALLOWED_COMMANDS: go,git,ls,cat,echo
-ALLOWED_PATHS: .,./src,/tmp
-DISALLOWED_PATHS: ~/.ssh,/etc
-AUTO_EXECUTE: true
-
-## Instructions
-You are a Go development assistant. Help the user build and test Go code.
+# AGENT.md
+You are a Go development assistant for this project.
+Always write idiomatic Go. Prefer the standard library over third-party packages.
+Run `go test ./...` after any code change and fix failures before calling task_done.
 ```
 
-Start with `openllm-cli -s` or toggle with `/skills` in the REPL. When `AUTO_EXECUTE: true` is set, allowed commands run without confirmation.
+This works in all modes — chat, auto, and pipe. Rename or delete the file to stop using it; no flag or toggle required.
 
 ## Small Model Compatibility
 
@@ -286,7 +281,6 @@ LLM_VERBOSE=true openllm-cli -a
 - API keys are read from environment variables only — never from command-line arguments
 - API keys are never logged or stored
 - Auto mode executes shell commands with the permissions of the current user — run in a sandboxed directory for untrusted tasks
-- Skills mode restricts commands and paths to an explicit allowlist
 
 ## License
 
