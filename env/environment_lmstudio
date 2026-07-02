@@ -4,7 +4,7 @@
 
 # ── Provider ────────────────────────────────────────────────
 export LLM_PROVIDER=lmstudio
-export LLM_MODEL=qwen/qwen3-coder-30b
+export LLM_MODEL=qwen/qwen3.5-9b
 # LM Studio uses whatever model is loaded in the app.
 # The model name here must match the identifier shown in LM Studio.
 
@@ -12,7 +12,7 @@ export LLM_MODEL=qwen/qwen3-coder-30b
 export LM_STUDIO_URL="http://localhost:1234/v1/chat/completions"
 
 # ── Request settings ────────────────────────────────────────
-export LLM_MAX_TOKENS=8096       # max tokens to generate
+export LLM_MAX_TOKENS=262144       # max tokens to generate
 export LLM_TIMEOUT=600           # LLM request timeout in seconds (large local models can be slow)
 export LLM_SHELL_TIMEOUT=60      # shell command timeout in seconds (auto mode)
 export LLM_STREAM=1              # 1=streaming tokens, 0=wait for full response
