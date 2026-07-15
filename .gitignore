@@ -1,0 +1,17 @@
+# Build artifacts
+bin/
+*.exe
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local env files with real keys (templates in env/ are tracked)
+.env
+.env.*

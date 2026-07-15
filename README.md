@@ -229,7 +229,7 @@ The agent picks the right approach for the task:
 
 ### Loop protection
 
-If the model gets stuck repeating the same tool result 3 times in a row (e.g. a malformed tool call it can't recover from), the loop breaks and reports what went wrong. This prevents runaway inference on low-capability models.
+If a model emits prose instead of a tool call after tool use has begun, the CLI sends up to two protocol corrections rather than silently ending the task. It also stops after 3 identical tool results or 64 total rounds. These bounds prevent runaway inference on low-capability models.
 
 ## Non-Auto Mode
 
@@ -261,6 +261,7 @@ The tool parser handles common output quirks from smaller local models:
 - **Missing inner tags** — `<run_shell>ls -la</run_shell>` works the same as `<run_shell><command>ls -la</command></run_shell>`
 - **Code-fenced tool calls** — tool calls wrapped in ` ```xml ` blocks are extracted automatically
 - **Whitespace in tag names** — `< run_shell >` is normalised to `<run_shell>`
+- **Escaped closing tags** — `<&#47;content>` inside `write_file` content is decoded back to `</content>`
 - **Helpful error feedback** — when a required field is missing, the error returned to the model includes the correct format so it can self-correct
 
 For best results with small models, use a non-streaming setup (`LLM_STREAM=0`) and set `LLM_VERBOSE=true` to see exactly what the model is outputting if something goes wrong.
@@ -280,7 +281,8 @@ LLM_VERBOSE=true openllm-cli -a
 
 - API keys are read from environment variables only — never from command-line arguments
 - API keys are never logged or stored
-- Auto mode executes shell commands with the permissions of the current user — run in a sandboxed directory for untrusted tasks
+- `read_file` and `write_file` reject absolute paths, `..` traversal, and symlink paths that escape the session working directory
+- Auto-mode shell commands still execute with the permissions of the current user and are not an OS sandbox — use a container or restricted account for untrusted tasks
 
 ## License
 
