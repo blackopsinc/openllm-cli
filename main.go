@@ -77,7 +77,6 @@ const (
 	maxPromptInputSize   = 16 * 1024 * 1024 // 16 MB — bounds piped prompts
 	maxStreamEventSize   = 4 * 1024 * 1024  // 4 MB — allows large streamed tool calls
 	maxDirectoryEntries  = 500              // bounds recursive directory listings
-	maxAutoRounds        = 64               // hard stop for runaway agents
 
 	// Model defaults per provider
 	defaultOpenRouterModel = "openai/gpt-4o-mini"
@@ -651,7 +650,7 @@ func (s *Session) runAutoTask() error {
 	fmt.Printf("%s  ↳ Type %s <message> + Enter to send context to the AI mid-task%s\n",
 		colorDim, btwMarker, colorReset)
 
-	for round := 0; round < maxAutoRounds; round++ {
+	for round := 0; ; round++ {
 		// Inject any /btw messages the user typed since the last round.
 		s.drainInterrupts(interruptCh)
 
@@ -748,7 +747,6 @@ func (s *Session) runAutoTask() error {
 		s.addUser(result)
 	}
 
-	return fmt.Errorf("reached maximum tool rounds (%d) without completing", maxAutoRounds)
 }
 
 func isTruncationStopReason(reason string) bool {
